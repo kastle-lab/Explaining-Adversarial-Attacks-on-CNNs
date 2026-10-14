@@ -132,10 +132,3 @@ if submitted or process_image:
             with overlay_col:
                 st.image(gradcam_result['overlay'], caption="Grad-CAM Overlay", use_column_width=True)
 
-   
-# Add the footer with email and GitHub link
-st.markdown("""
-    **Contact Information**:
-    - **Email**: [adalal@ksu.edu](mailto:adalal@ksu.edu)
-    - **GitHub**: [https://github.com/abhilekha-dalal](https://github.com/abhilekha-dalal)
-""")

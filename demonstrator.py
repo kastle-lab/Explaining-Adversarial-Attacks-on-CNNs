@@ -242,7 +242,6 @@ def get_denseActivations(folder_path):
     df=pd.DataFrame(predIdxs)
     df['Class_names'] = class_names
     df['filenames'] = filenames
-    #df.to_csv (r'/homes/adalal/virtualenvs/demonstrator/activations/demo_building_denseactivations.csv', index = None, header=True) 
     return df
     
 

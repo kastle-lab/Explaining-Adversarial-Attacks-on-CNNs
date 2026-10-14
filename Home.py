@@ -37,7 +37,6 @@ with col1:
 with col2:
     st.markdown("# :rainbow[ConceptLens]")
     st.subheader("_from Pixels to Understanding_")
-    st.markdown("**Created by Abhilekha Dalal**")
 
 #####################
 st.header("Summary")
@@ -60,13 +59,5 @@ st.markdown("- **Explore ConceptLens:** This section allows you to explore *Conc
 #st.markdown("- **Explore ConceptLens now:** This takes you directly to the Upload Images page.")
 st.markdown("- **Related Resources:** Interested in learning more about the research behind *ConceptLens*? Visit this section to find links to the relevant paper." )
 #####################
-st.header("Authors")
-st.write("Please feel free to contact with any issues, comments, or questions.")
-st.subheader("Abhilekha Dalal")
-contact_info = """
-**Email:** [adalal@ksu.edu](mailto:adalal@ksu.edu)  
-**GitHub:** [https://github.com/abhilekha-dalal](https://github.com/abhilekha-dalal)
-"""
 
-st.markdown(contact_info)
 

@@ -30,9 +30,5 @@ concept analysis, and error-rate percentages continue to use the included
 `model_resnet50V2_10classes_retest2023June.h5`; ResNet50 is used only to
 produce the Grad-CAM overlay.
 
-## Authors
-Please feel free to contact with any issues, comments, or questions.
-### Abhilekha Dalal
-**Email:** [adalal@ksu.edu](mailto:adalal@ksu.edu)  
-**GitHub:** [https://github.com/abhilekha-dalal](https://github.com/abhilekha-dalal)
+
 
