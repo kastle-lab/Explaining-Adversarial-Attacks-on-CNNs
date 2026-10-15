@@ -110,7 +110,8 @@ if submitted or process_image:
         st.markdown("### Grad-CAM Saliency Map")
         st.caption(
             "ConceptLens describes the 64-neuron concept representation. "
-            "Grad-CAM separately highlights image regions that influenced the selected class score."
+            "Grad-CAM uses the same scene classifier to highlight regions that "
+            "influenced its predicted class score."
         )
 
         for image_name in os.listdir(class_folder_path):

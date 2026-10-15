@@ -24,11 +24,10 @@ Make sure you have all the necessary requirements by referring to the requiremen
    streamlit run Home.py
    ```
 
-The first Grad-CAM request downloads Keras's standard pretrained ImageNet
-ResNet50 weights if they are not already cached. ConceptLens predictions,
-concept analysis, and error-rate percentages continue to use the included
-`model_resnet50V2_10classes_retest2023June.h5`; ResNet50 is used only to
-produce the Grad-CAM overlay.
+Grad-CAM uses the included `model_resnet50V2_10classes_retest2023June.h5`
+directly. The same ResNet50V2 classifier produces the scene prediction and
+the gradients for the Grad-CAM heatmap; no additional CNN or ImageNet weights
+are loaded.
 
 
 

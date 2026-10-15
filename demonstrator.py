@@ -43,12 +43,6 @@ def load_conceptlens_model():
     return load_model(MODEL_PATH, compile=False)
 
 
-@st.cache_resource
-def load_gradcam_resnet50():
-    """Load the separate ImageNet ResNet50 used only for Grad-CAM overlays."""
-    return tf.keras.applications.ResNet50(weights='imagenet')
-
-
 def _layer_shape(layer):
     """Return a readable output shape without assuming a single output tensor."""
     shape = getattr(layer, 'output_shape', None)
@@ -58,10 +52,28 @@ def _layer_shape(layer):
 def find_gradcam_layer(model):
     """Find the model's final spatial feature map, or raise a useful diagnostic.
 
-    In this saved ResNet50V2 model this resolves to ``post_relu``: the final
-    7x7x2048 residual-stage feature map.  It is intentionally not the 64-unit
-    dense layer used by ConceptLens.
+    The loaded ConceptLens model is expected to contain ``post_relu`` at layer
+    189 with shape ``(None, 7, 7, 2048)``.  Verify that exact, connected layer
+    first; the fallback keeps the helper useful if a compatible ConceptLens
+    checkpoint is later saved with different layer names.
     """
+    try:
+        post_relu = model.get_layer('post_relu')
+    except (AttributeError, ValueError):
+        post_relu = None
+
+    if post_relu is not None:
+        shape = _layer_shape(post_relu)
+        if (
+            post_relu in model.layers
+            and len(model.layers) > 189
+            and model.layers[189] is post_relu
+            and shape is not None
+            and len(shape) == 4
+            and shape[1:] == (7, 7, 2048)
+        ):
+            return post_relu
+
     candidates = []
     for layer in reversed(model.layers):
         shape = _layer_shape(layer)
@@ -94,12 +106,12 @@ def find_gradcam_layer(model):
     return layer
 
 
-def generate_gradcam(image_path, model=None, gradcam_model=None):
+def generate_gradcam(image_path, model=None):
     """Generate a normalized Grad-CAM heatmap and overlay for one JPEG image.
 
     The returned heatmap has the original image's height and width, contains
-    values in [0, 1].  Class and score remain from the ConceptLens model;
-    only the heatmap is calculated with a separate ImageNet ResNet50.
+    values in [0, 1].  Prediction and gradients both come from the same loaded
+    ConceptLens ResNet50V2 classifier.
     """
     path = Path(image_path)
     if path.suffix.lower() not in {'.jpg', '.jpeg'}:
@@ -127,33 +139,23 @@ def generate_gradcam(image_path, model=None, gradcam_model=None):
             f'Expected a 10-class model output, but received {model.output_shape}.'
         )
 
-    conceptlens_predictions = model(conceptlens_input, training=False)
-    conceptlens_index = int(tf.argmax(conceptlens_predictions[0]).numpy())
-
-    if gradcam_model is None:
-        try:
-            gradcam_model = load_gradcam_resnet50()
-        except (OSError, ValueError) as exc:
-            raise GradCAMError(f'ImageNet ResNet50 could not be loaded: {exc}') from exc
-
-    gradcam_layer = find_gradcam_layer(gradcam_model)
+    gradcam_layer = find_gradcam_layer(model)
     try:
         grad_model = Model(
-            gradcam_model.inputs, [gradcam_layer.output, gradcam_model.output]
+            model.inputs, [gradcam_layer.output, model.output]
         )
     except (ValueError, TypeError) as exc:
         raise GradCAMError(
             f"Layer '{gradcam_layer.name}' is not connected to the classifier output."
         ) from exc
 
-    resnet50_input = tf.keras.applications.resnet50.preprocess_input(
-        np.expand_dims(image_array.copy(), axis=0)
-    )
     with tf.GradientTape() as tape:
-        feature_maps, predictions = grad_model(resnet50_input, training=False)
+        feature_maps, predictions = grad_model(conceptlens_input, training=False)
         predicted_index = tf.argmax(predictions[0])
         class_score = predictions[:, predicted_index]
     gradients = tape.gradient(class_score, feature_maps)
+
+    conceptlens_index = int(predicted_index.numpy())
 
     if gradients is None:
         raise GradCAMError(
@@ -184,7 +186,7 @@ def generate_gradcam(image_path, model=None, gradcam_model=None):
 
     return {
         'predicted_class': CLASS_NAMES[conceptlens_index],
-        'prediction_score': float(conceptlens_predictions[0, conceptlens_index].numpy()),
+        'prediction_score': float(predictions[0, conceptlens_index].numpy()),
         'heatmap': resized_heatmap,
         'overlay': PIL.Image.fromarray(overlay_array),
         'layer_name': gradcam_layer.name,
