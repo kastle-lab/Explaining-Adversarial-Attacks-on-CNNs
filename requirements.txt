@@ -1,6 +1,5 @@
 matplotlib==3.7.5
 tensorflow==2.13.0
-openpyxl
 streamlit==1.35.0
 streamlit-image-select==0.6.0
 openpyxl==3.1.2

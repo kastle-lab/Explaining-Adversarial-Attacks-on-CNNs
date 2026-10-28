@@ -364,3 +364,10 @@ FodyWeavers.xsd
 
 # Virtual Environment for Visual Studio
 .venv/
+
+# Locally generated ConceptLens inputs and outputs
+# `input_images/` is the default local batch-input directory; repository examples
+# live at the project root and remain trackable.
+input_images/
+batch_results/
+uploads/

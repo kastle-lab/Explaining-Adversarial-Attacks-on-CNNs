@@ -19,6 +19,7 @@ from tensorflow.keras.preprocessing import image
 from tensorflow.keras.models import load_model
 from tensorflow.keras.models import Model
 import collections
+from io import BytesIO
 from pathlib import Path
 import streamlit as st
 #from flask import Flask, request, render_template, redirect, url_for
@@ -33,6 +34,91 @@ CLASS_NAMES = [
 
 class GradCAMError(RuntimeError):
     """Raised when a spatial Grad-CAM explanation cannot be generated."""
+
+
+def plot_concept_bars(axis, concept_results):
+    """Render the exact ConceptLens bar-chart data treatment used in the UI."""
+    sorted_results = concept_results.sort_values(
+        by='Non-Target Percentage', ascending=False
+    )
+    axis.barh(sorted_results['Detected Concept'], sorted_results['Non-Target Percentage'])
+    axis.set_xlabel('Error-rate Percentage')
+
+
+def render_concept_visualization(input_image, image_name, concept_results):
+    """Create a standalone PNG-ready version of the Streamlit concept section.
+
+    Streamlit itself lays out widgets in HTML, so a standalone file cannot use
+    its DOM/CSS. This figure mirrors its heading, two-column proportions,
+    caption placement, and the shared chart renderer above.
+    """
+    figure = plt.figure(figsize=(15, 8), facecolor='white')
+    figure.text(0.035, 0.965, 'Detected Concepts and Error-rate Percentages',
+                ha='left', va='top', fontsize=19, fontweight='bold', color='#262730')
+    grid = figure.add_gridspec(1, 2, left=0.035, right=0.97, bottom=0.10,
+                               top=0.89, width_ratios=[1, 2], wspace=0.22)
+    image_axis = figure.add_subplot(grid[0, 0])
+    image_axis.imshow(input_image)
+    image_axis.set_xticks([])
+    image_axis.set_yticks([])
+    image_axis.set_xlabel(image_name, fontsize=10, color='#6c757d', labelpad=10)
+    for spine in image_axis.spines.values():
+        spine.set_visible(False)
+
+    chart_axis = figure.add_subplot(grid[0, 1])
+    if concept_results.empty:
+        chart_axis.text(0.5, 0.5, 'No concepts detected', ha='center', va='center',
+                        color='#6c757d', transform=chart_axis.transAxes)
+        chart_axis.set_xlabel('Error-rate Percentage')
+    else:
+        plot_concept_bars(chart_axis, concept_results)
+    return figure
+
+
+def render_gradcam_visualization(input_image, image_name, gradcam_result):
+    """Create a standalone PNG-ready version of the Streamlit Grad-CAM section."""
+    figure = plt.figure(figsize=(15, 9), facecolor='white')
+    figure.text(0.035, 0.965, 'Grad-CAM Saliency Map', ha='left', va='top',
+                fontsize=19, fontweight='bold', color='#262730')
+    figure.text(
+        0.035, 0.922,
+        'ConceptLens describes the 64-neuron concept representation. '
+        'Grad-CAM uses the same scene classifier to highlight regions that '
+        'influenced its predicted class score.',
+        ha='left', va='top', fontsize=10, color='#6c757d'
+    )
+    figure.text(0.035, 0.858, image_name, ha='left', va='top',
+                fontsize=14, fontweight='bold', color='#262730')
+    figure.text(
+        0.035, 0.824,
+        f"Predicted Class: {gradcam_result['predicted_class']}  |  "
+        f"Prediction Score: {gradcam_result['prediction_score']:.4f}",
+        ha='left', va='top', fontsize=12, color='#262730'
+    )
+    grid = figure.add_gridspec(1, 2, left=0.035, right=0.97, bottom=0.08,
+                               top=0.76, wspace=0.08)
+    original_axis = figure.add_subplot(grid[0, 0])
+    original_axis.imshow(input_image)
+    original_axis.set_xticks([])
+    original_axis.set_yticks([])
+    original_axis.set_xlabel('Original Image', fontsize=10, color='#6c757d', labelpad=10)
+    overlay_axis = figure.add_subplot(grid[0, 1])
+    overlay_axis.imshow(gradcam_result['overlay'])
+    overlay_axis.set_xticks([])
+    overlay_axis.set_yticks([])
+    overlay_axis.set_xlabel('Grad-CAM Overlay', fontsize=10, color='#6c757d', labelpad=10)
+    for axis in (original_axis, overlay_axis):
+        for spine in axis.spines.values():
+            spine.set_visible(False)
+    return figure
+
+
+def figure_to_png_bytes(figure):
+    """Serialize one shared visualization figure for Streamlit downloads."""
+    image_bytes = BytesIO()
+    figure.savefig(image_bytes, format='png', dpi=150, facecolor='white')
+    image_bytes.seek(0)
+    return image_bytes.getvalue()
 
 
 @st.cache_resource
@@ -107,15 +193,15 @@ def find_gradcam_layer(model):
 
 
 def generate_gradcam(image_path, model=None):
-    """Generate a normalized Grad-CAM heatmap and overlay for one JPEG image.
+    """Generate a normalized Grad-CAM heatmap and overlay for one JPEG or PNG image.
 
     The returned heatmap has the original image's height and width, contains
     values in [0, 1].  Prediction and gradients both come from the same loaded
     ConceptLens ResNet50V2 classifier.
     """
     path = Path(image_path)
-    if path.suffix.lower() not in {'.jpg', '.jpeg'}:
-        raise GradCAMError('Grad-CAM supports JPEG images (.jpg or .jpeg).')
+    if path.suffix.lower() not in {'.jpg', '.jpeg', '.png'}:
+        raise GradCAMError('Grad-CAM supports JPEG and PNG images (.jpg, .jpeg, or .png).')
     if not path.is_file():
         raise GradCAMError(f'Image could not be loaded: {path}')
 
@@ -252,7 +338,8 @@ def get_denseActivations(folder_path):
 
 
 def get_base_activations():
-    df = pd.read_excel('activation_cutoffs_ensemble.xlsx', sheet_name='concepts_wrt_neuron')
+    calibration_path = Path(__file__).resolve().parent / 'activation_cutoffs_ensemble.xlsx'
+    df = pd.read_excel(calibration_path, sheet_name='concepts_wrt_neuron')
     df = df.dropna()
    
     ans = collections.defaultdict(list)
