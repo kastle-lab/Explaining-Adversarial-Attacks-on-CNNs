@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="Classify a scene image with the trained ResNet50V2 model."
+    />
+    <title>Scene Lens</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@600;700;800&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css', v='2') }}" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="hero">
+        <div class="eyebrow"><span></span> Local ResNet50V2 model</div>
+        <h1>See what kind of<br /><em>place</em> is in your image.</h1>
+        <p>
+          Drop in a scene photo and the trained model will compare it across
+          {{ class_count }} place categories—entirely on this computer.
+        </p>
+      </header>
+
+      <section class="workspace" aria-label="Scene classifier">
+        <form id="predict-form" class="upload-panel">
+          <label id="drop-zone" class="drop-zone" for="image-input">
+            <input id="image-input" name="image" type="file" accept="image/*" />
+            <span class="upload-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" role="img">
+                <path d="M12 16V4m0 0L7.5 8.5M12 4l4.5 4.5M5 13v5a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-5" />
+              </svg>
+            </span>
+            <strong>Choose a scene image</strong>
+            <small>or drag and drop · JPG, PNG, or WEBP · up to 10 MB</small>
+          </label>
+          <div class="selected-file" id="selected-file" hidden>
+            <span id="file-name"></span>
+            <button type="button" id="clear-file" aria-label="Remove selected image">×</button>
+          </div>
+          <button id="predict-button" class="predict-button" type="submit" disabled>
+            <span>Analyze scene</span>
+            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 10h12m-5-5 5 5-5 5" /></svg>
+          </button>
+          <p class="error" id="error" role="alert" hidden></p>
+        </form>
+
+        <article id="result-panel" class="result-panel is-empty" aria-live="polite">
+          <div id="empty-state" class="empty-state">
+            <span class="scan-mark" aria-hidden="true"></span>
+            <p>Your prediction will appear here.</p>
+          </div>
+
+          <div id="loading-state" class="loading-state" hidden>
+            <div class="loader" aria-hidden="true"></div>
+            <strong>Reading the scene…</strong>
+            <small>The first prediction may take a few seconds.</small>
+          </div>
+
+          <div id="result" class="result" hidden>
+            <div class="result-image-wrap">
+              <img id="result-image" alt="Uploaded scene" />
+              <span>Top match</span>
+            </div>
+            <div class="result-copy">
+              <p class="result-kicker">The model sees</p>
+              <h2 id="prediction"></h2>
+              <p class="confidence"><strong id="confidence"></strong> confidence</p>
+              <div class="ranking">
+                <div class="ranking-title">
+                  <span>Closest categories</span>
+                  <span>Confidence</span>
+                </div>
+                <ol id="top-results"></ol>
+              </div>
+            </div>
+          </div>
+        </article>
+      </section>
+
+      <footer>
+        <span>50-category scene classifier</span>
+        <span>No uploads, predictions, cookies, or history are saved</span>
+      </footer>
+    </main>
+
+    <script src="{{ url_for('static', filename='app.js') }}"></script>
+  </body>
+</html>
