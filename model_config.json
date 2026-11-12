@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "checkpoint": "models/model_resnet50V2_50classes_ade20k.h5",
+  "checkpoint_sha256": "B042699DD5D5AC5BCB367A457081F7385A2EAEBF3B5BB5D5662BE2FFC5360562",
+  "labels": "class_labels_50.json",
+  "activation_reference": "activation_reference_50class.csv",
+  "activation_scene_associations": "activation_scene_associations_50class.csv",
+  "activation_scene_associations_sha256": "B461BCB5706B3E8C3A22998AA7DEDCA2B94BE74919EFB130BDFED4E14F6CD9FA",
+  "positive_examples": "positive_images_50class.csv",
+  "positive_examples_sha256": "395AADAE18305D1B462B87A6F36A9DB23F06C03588FEAB2CA7DB224C4B4C1704",
+  "negative_examples": "negative_images_50class.csv",
+  "negative_examples_sha256": "36EE6BB298F6D46FBDE77CAFC9EF758B3A3DCBF3B9514DCA51E38B5C503ED7D7",
+  "input": {
+    "height": 224,
+    "width": 224,
+    "channels": 3,
+    "channel_order": "RGB",
+    "data_format": "channels_last",
+    "normalization": "pixel_value / 255.0"
+  },
+  "expected_output_classes": 50,
+  "classification_layer": "dense_1",
+  "activation_layer": "dense",
+  "activation_units": 64,
+  "gradcam_layer": "post_relu",
+  "ontology_concept_semantics_available": false,
+  "scene_associations_available": true,
+  "scene_associations_note": "High/moderate-evidence labels are descriptive one-vs-rest scene associations from the 1,921-image activation reference. They are not object-level ontology concepts, causal neuron identities, probabilities, or error rates."
+}
+
+

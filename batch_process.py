@@ -23,19 +23,22 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from PIL import Image
-from tensorflow.keras.models import Model
-from tensorflow.keras.preprocessing import image as keras_image
 
-from demonstrator import (
+from conceptlens_model import (
     CLASS_NAMES,
-    GradCAMError,
+    MODEL_PATH,
+    activation_model_for,
+    class_record,
+    get_model_config,
+    load_conceptlens_model,
+    preprocess_image_path,
+)
+from demonstrator import (
+    activation_rows_for,
     figure_to_png_bytes,
     generate_gradcam,
-    get_base_activations,
-    load_conceptlens_model,
-    render_concept_visualization,
+    render_activation_visualization,
     render_gradcam_visualization,
-    process_activation_data,
 )
 
 
@@ -43,6 +46,19 @@ NOISE_LEVELS = (0, 10, 20, 30, 40, 50, 80)
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png"}
 NOISE_METHOD = "gaussian"
 SIGMA_AT_100_PERCENT = 40.0
+MANIFEST_SCHEMA_VERSION = 2
+MODEL_CONFIG = get_model_config()
+PIPELINE_METADATA = {
+    "model_checkpoint": MODEL_PATH.name,
+    "model_sha256": MODEL_CONFIG["checkpoint_sha256"],
+    "labels_file": MODEL_CONFIG["labels"],
+    "activation_scene_associations": MODEL_CONFIG["activation_scene_associations"],
+    "activation_scene_associations_sha256": MODEL_CONFIG[
+        "activation_scene_associations_sha256"
+    ],
+    "preprocessing": "RGB; resize 224x224; float32; pixel/255.0",
+    "report_schema_version": 2,
+}
 
 
 def noise_sigma(noise_level: int) -> float:
@@ -90,23 +106,31 @@ class ArtifactConflictError(FileExistsError):
     """Raised when a simple artifact name would replace an existing result."""
 
 
-def artifact_path(directory: Path, filename: str) -> Path:
-    """Return a direct artifact path, refusing to overwrite an existing file."""
+def artifact_path(directory: Path, filename: str, collision_suffix: str = "") -> Path:
+    """Return a non-overwriting artifact path.
+
+    The legacy simple name is retained for a condition's first attempt. If a
+    retained artifact already occupies that name, retries, explicit reruns,
+    changed source versions, and same-stem inputs receive a unique suffix.
+    """
     target = directory / filename
-    if target.exists():
-        raise ArtifactConflictError(
-            f"Artifact conflict: refusing to overwrite existing file {target}. "
-            "Rename or move the existing artifact before rerunning this condition."
-        )
-    return target
+    if not target.exists():
+        return target
+    if collision_suffix:
+        alternative = target.with_name(f"{target.stem}_{collision_suffix}{target.suffix}")
+        if not alternative.exists():
+            return alternative
+    raise ArtifactConflictError(
+        f"Artifact conflict: refusing to overwrite existing file {target}."
+    )
 
 
 def make_output_dirs(output_dir: Path) -> dict[str, Path]:
     directories = {
         name: output_dir / name
         for name in (
-            "noisy", "gradcam", "concepts", "csv", "logs",
-            "concept_visualizations", "gradcam_visualizations",
+            "noisy", "gradcam", "activations", "csv", "logs",
+            "activation_visualizations", "gradcam_visualizations",
         )
     }
     for directory in directories.values():
@@ -114,9 +138,26 @@ def make_output_dirs(output_dir: Path) -> dict[str, Path]:
     return directories
 
 
+def close_batch_logging() -> None:
+    """Release root log handlers so Windows can remove completed test/output trees."""
+    root_logger = logging.getLogger()
+    for handler in root_logger.handlers[:]:
+        handler.flush()
+        handler.close()
+        root_logger.removeHandler(handler)
+
+
 def csv_append_writer(path: Path, fieldnames: list[str]) -> tuple[Any, csv.DictWriter]:
     """Open a result CSV for append, retaining its original header and rows."""
     needs_header = not path.exists() or path.stat().st_size == 0
+    if not needs_header:
+        with path.open(newline="", encoding="utf-8") as existing:
+            current_header = next(csv.reader(existing), [])
+        if current_header != fieldnames:
+            raise ValueError(
+                f"Existing CSV schema is incompatible with the 50-class pipeline: {path}. "
+                "Use a new output directory so legacy results remain unchanged."
+            )
     handle = path.open("a", newline="", encoding="utf-8")
     writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
     if needs_header:
@@ -137,58 +178,33 @@ def manifest_path(output_dir: Path) -> Path:
     return output_dir / "processing_manifest.json"
 
 
-def load_manifest(output_dir: Path, input_dir: Path, images: list[Path]) -> dict[str, Any]:
-    """Load the ledger, importing legacy successful CSV rows on first use.
-
-    Legacy CSVs did not record a content hash.  During this one-time import,
-    their successes are associated with the current bytes at that path; every
-    later run compares the recorded hash with the source before deciding to
-    skip it.
-    """
+def load_manifest(output_dir: Path) -> dict[str, Any]:
+    """Load only a ledger tied to this exact 50-class model pipeline."""
     path = manifest_path(output_dir)
     if path.exists():
         try:
             loaded = json.loads(path.read_text(encoding="utf-8"))
-            if loaded.get("schema_version") == 1 and isinstance(loaded.get("images"), dict):
+            if (
+                loaded.get("schema_version") == MANIFEST_SCHEMA_VERSION
+                and loaded.get("pipeline") == PIPELINE_METADATA
+                and isinstance(loaded.get("images"), dict)
+            ):
                 return loaded
-        except (json.JSONDecodeError, OSError, AttributeError):
-            logging.warning("Ignoring unreadable processing manifest: %s", path)
+        except (json.JSONDecodeError, OSError, AttributeError) as exc:
+            raise ValueError(
+                f"Existing processing manifest is unreadable: {path}. "
+                "Use a new output directory to preserve existing results."
+            ) from exc
+        raise ValueError(
+            f"Existing processing manifest belongs to an incompatible model pipeline: {path}. "
+            "Use a new output directory so legacy results remain unchanged."
+        )
 
-    manifest: dict[str, Any] = {"schema_version": 1, "images": {}}
-    legacy_successes: dict[str, set[int]] = {}
-    for filename in ("experiment_summary.csv", "predictions.csv"):
-        csv_path = output_dir / "csv" / filename
-        if not csv_path.exists():
-            continue
-        try:
-            with csv_path.open(newline="", encoding="utf-8") as handle:
-                for row in csv.DictReader(handle):
-                    if row.get("processing_status") != "success":
-                        continue
-                    try:
-                        level = int(row["noise_level"])
-                    except (KeyError, TypeError, ValueError):
-                        continue
-                    if level in NOISE_LEVELS and row.get("image_name"):
-                        legacy_successes.setdefault(row["image_name"], set()).add(level)
-        except OSError:
-            logging.warning("Could not import legacy result CSV: %s", csv_path)
-
-    for source_path in images:
-        image_name = source_path.relative_to(input_dir).as_posix()
-        completed = legacy_successes.get(image_name, set())
-        if not completed:
-            continue
-        source_digest = content_hash(source_path)
-        conditions = {str(level): {"status": "success", "imported_from_legacy_csv": True}
-                      for level in sorted(completed)}
-        manifest["images"][image_name] = {"versions": {source_digest: {
-            "source_hash": source_digest,
-            "completed_noise_levels": sorted(completed),
-            "conditions": conditions,
-            "processing_status": "complete" if set(completed) == set(NOISE_LEVELS) else "incomplete",
-        }}}
-    return manifest
+    return {
+        "schema_version": MANIFEST_SCHEMA_VERSION,
+        "pipeline": PIPELINE_METADATA,
+        "images": {},
+    }
 
 
 def save_manifest(output_dir: Path, manifest: dict[str, Any]) -> None:
@@ -222,56 +238,79 @@ def relative_reference(path: Path, output_dir: Path) -> str:
     return path.resolve().relative_to(output_dir.resolve()).as_posix()
 
 
-def activation_model_for(model: Any) -> Model:
-    """Reuse the exact 64-neuron layer selected by get_denseActivations()."""
-    return Model(inputs=model.input, outputs=[layer.output for layer in model.layers[-3:-2]])
-
-
-def concept_input_for(image_path: Path) -> np.ndarray:
-    """Mirror get_denseActivations' Keras load_img and ImageDataGenerator scaling.
-
-    This intentionally differs from Grad-CAM's Pillow resize because the
-    Streamlit concept pipeline uses Keras' default target-size interpolation.
-    """
-    loaded = keras_image.load_img(image_path, target_size=(224, 224))
-    pixels = keras_image.img_to_array(loaded)
-    return np.expand_dims(pixels, axis=0) / 255.0
-
-
-def concept_rows_for(
-    activations: np.ndarray, calibration: dict[str, list[list[Any]]], metadata: dict[str, Any]
+def activation_rows_for_batch(
+    activations: np.ndarray, metadata: dict[str, Any]
 ) -> list[dict[str, Any]]:
-    """Apply the unchanged spreadsheet mapping, adding only provenance columns."""
-    # process_activation_data indexes activations by DataFrame column, exactly
-    # as image_processing_function does after get_denseActivations().
-    activation_frame = pd.DataFrame(activations, columns=range(activations.shape[1]))
-    concepts, non_target_percentages = process_activation_data(activation_frame, calibration)
+    """Record all 64 activations and evidence-qualified scene associations."""
+    frame = activation_rows_for(np.asarray(activations).reshape(-1))
     rows: list[dict[str, Any]] = []
-    for concept, percentage in zip(concepts, non_target_percentages):
-        # The existing public result exposes one value per concept, not which
-        # mapped neuron caused detection.  Record the calibration neuron(s)
-        # faithfully, and leave activation_value blank rather than infer it.
-        neuron_ids = [str(values[0]) for values in calibration.get(concept, [])]
+    for _, row in frame.iterrows():
         rows.append({
             **metadata,
-            "detected_concept": concept,
-            "neuron_id": "; ".join(neuron_ids),
-            "activation_value": "",
-            "non_target_percentage": percentage,
+            "neuron_id": int(row["Neuron ID"]),
+            "activation_value": float(row["Activation Value"]),
+            "reference_maximum": float(row["Reference Maximum"]),
+            "reference_percentage": (
+                float(row["Reference Percentage"])
+                if pd.notna(row["Reference Percentage"])
+                else ""
+            ),
+            "reference_available": bool(row["Reference Available"]),
+            "scene_association": row["Scene Association"],
+            "primary_scene_association_id": row["Primary Scene Association ID"],
+            "association_auc": (
+                float(row["Association AUC"]) if pd.notna(row["Association AUC"]) else ""
+            ),
+            "secondary_scene_association_id": row["Secondary Scene Association ID"],
+            "secondary_association_auc": (
+                float(row["Secondary Association AUC"])
+                if pd.notna(row["Secondary Association AUC"])
+                else ""
+            ),
+            "auc_margin": float(row["AUC Margin"]) if pd.notna(row["AUC Margin"]) else "",
+            "evidence_tier": row["Evidence Tier"],
+            "association_available": bool(row["Association Available"]),
         })
     return rows
 
 
-def save_concept_visualization(
-    image_path: Path, image_name: str, concept_rows: list[dict[str, Any]], output_path: Path
+def save_activation_visualization(
+    image_path: Path, image_name: str, activation_rows: list[dict[str, Any]], output_path: Path
 ) -> None:
-    """Save the same shared concept report used for Streamlit downloads."""
-    concepts_frame = pd.DataFrame({
-        "Detected Concept": [row["detected_concept"] for row in concept_rows],
-        "Non-Target Percentage": [row["non_target_percentage"] for row in concept_rows],
+    """Save the same scene-association activation report used by Streamlit."""
+    activation_frame = pd.DataFrame({
+        "Neuron ID": [row["neuron_id"] for row in activation_rows],
+        "Activation Value": [row["activation_value"] for row in activation_rows],
+        "Reference Maximum": [row["reference_maximum"] for row in activation_rows],
+        "Reference Percentage": [
+            np.nan if row["reference_percentage"] == "" else row["reference_percentage"]
+            for row in activation_rows
+        ],
+        "Reference Available": [row["reference_available"] for row in activation_rows],
+        "Scene Association": [row["scene_association"] for row in activation_rows],
+        "Primary Scene Association ID": [
+            row["primary_scene_association_id"] for row in activation_rows
+        ],
+        "Association AUC": [
+            np.nan if row["association_auc"] == "" else row["association_auc"]
+            for row in activation_rows
+        ],
+        "Secondary Scene Association ID": [
+            row["secondary_scene_association_id"] for row in activation_rows
+        ],
+        "Secondary Association AUC": [
+            np.nan if row["secondary_association_auc"] == "" else row["secondary_association_auc"]
+            for row in activation_rows
+        ],
+        "AUC Margin": [
+            np.nan if row["auc_margin"] == "" else row["auc_margin"]
+            for row in activation_rows
+        ],
+        "Evidence Tier": [row["evidence_tier"] for row in activation_rows],
+        "Association Available": [row["association_available"] for row in activation_rows],
     })
     with Image.open(image_path) as input_image:
-        figure = render_concept_visualization(input_image, image_name, concepts_frame)
+        figure = render_activation_visualization(input_image, image_name, activation_frame)
     output_path.write_bytes(figure_to_png_bytes(figure))
     plt.close(figure)
 
@@ -294,8 +333,13 @@ def run_batch(input_dir: Path, output_dir: Path, seed: int, *, new_only: bool = 
                         format="%(asctime)s %(levelname)s %(message)s", force=True)
     images = sorted(path for path in input_dir.rglob("*") if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS)
     if not images:
+        close_batch_logging()
         raise ValueError(f"No JPEG or PNG images found in {input_dir}")
-    manifest = load_manifest(output_dir, input_dir, images)
+    try:
+        manifest = load_manifest(output_dir)
+    except Exception:
+        close_batch_logging()
+        raise
     # A single invocation receives one id, while path + content hash make every
     # artifact version unambiguous.  This deliberately leaves failed-attempt
     # files in place for investigation rather than overwriting them on retry.
@@ -311,33 +355,59 @@ def run_batch(input_dir: Path, output_dir: Path, seed: int, *, new_only: bool = 
         else:
             logging.info("Skipping %s; its current content version is already complete", source_path)
     if not work_items:
-        # This also writes the one-time legacy CSV import when no new work is
-        # required, without opening or modifying result CSVs.
+        # Persist the current pipeline-fingerprinted ledger without touching CSVs.
         save_manifest(output_dir, manifest)
+        close_batch_logging()
         return
 
-    noise_metadata_fields = ["noise_method", "noise_sigma", "reproducibility_seed", "image_width", "image_height"]
-    prediction_fields = ["image_name", "noise_level", *noise_metadata_fields, "predicted_class", "predicted_class_score", *CLASS_NAMES,
+    source_metadata_fields = ["source_image_path", "source_image_hash", "attempt_id"]
+    noise_metadata_fields = [
+        "noise_method", "noise_sigma", "reproducibility_seed", "image_width", "image_height",
+        "model_checkpoint", "model_sha256", "scene_associations_sha256", "preprocessing",
+    ]
+    prediction_fields = ["image_name", *source_metadata_fields, "noise_level", *noise_metadata_fields,
+                         "predicted_class", "predicted_class_name", "predicted_class_score", *CLASS_NAMES,
                          "processing_status", "error_message"]
-    concept_fields = ["image_name", "noise_level", *noise_metadata_fields,
-                      "detected_concept", "neuron_id", "activation_value", "non_target_percentage"]
-    summary_fields = ["image_name", "noise_level", *noise_metadata_fields,
+    activation_fields = ["image_name", *source_metadata_fields, "noise_level", *noise_metadata_fields,
+                         "neuron_id", "activation_value", "reference_maximum",
+                         "reference_percentage", "reference_available",
+                         "scene_association", "primary_scene_association_id",
+                         "association_auc", "secondary_scene_association_id",
+                         "secondary_association_auc", "auc_margin", "evidence_tier",
+                         "association_available"]
+    summary_fields = ["image_name", *source_metadata_fields, "noise_level", *noise_metadata_fields,
                       "original_image_reference", "noisy_image_reference",
-                      "predicted_class", "predicted_class_score", "number_of_concepts", "concept_results_reference",
-                      "gradcam_output_reference", "concept_visualization_reference",
+                      "predicted_class", "predicted_class_name", "predicted_class_score",
+                      "number_of_activation_rows", "activation_results_reference",
+                      "gradcam_output_reference", "activation_visualization_reference",
                       "gradcam_visualization_reference", "processing_status", "error_details"]
-    prediction_file, prediction_writer = csv_append_writer(dirs["csv"] / "predictions.csv", prediction_fields)
-    concept_file, concept_writer = csv_append_writer(dirs["csv"] / "concepts.csv", concept_fields)
-    summary_file, summary_writer = csv_append_writer(dirs["csv"] / "experiment_summary.csv", summary_fields)
+    prediction_file = activation_file = summary_file = None
+    try:
+        prediction_file, prediction_writer = csv_append_writer(
+            dirs["csv"] / "predictions.csv", prediction_fields
+        )
+        activation_file, activation_writer = csv_append_writer(
+            dirs["csv"] / "activations.csv", activation_fields
+        )
+        summary_file, summary_writer = csv_append_writer(
+            dirs["csv"] / "experiment_summary.csv", summary_fields
+        )
+    except Exception:
+        for handle in (prediction_file, activation_file, summary_file):
+            if handle is not None:
+                handle.close()
+        close_batch_logging()
+        raise
 
     try:
         model = load_conceptlens_model()
         activations_model = activation_model_for(model)
-        calibration = get_base_activations()
         for source_path, source_digest, record, selected_levels in work_items:
             relative_path = source_path.relative_to(input_dir)
             image_name = relative_path.as_posix()
             artifact_base_name = relative_path.stem
+            path_digest = hashlib.sha256(image_name.encode("utf-8")).hexdigest()[:8]
+            collision_suffix = f"{path_digest}_{source_digest[:8]}_{attempt_id}"
             original_reference = str(source_path)
             for level in selected_levels:
                 condition_path = source_path
@@ -345,25 +415,35 @@ def run_batch(input_dir: Path, output_dir: Path, seed: int, *, new_only: bool = 
                 reproducibility_seed = condition_seed(seed, image_name, level)
                 noisy_reference = ""
                 gradcam_reference = ""
-                concept_reference = ""
-                concept_visualization_reference = ""
+                activation_reference = ""
+                activation_visualization_reference = ""
                 gradcam_visualization_reference = ""
                 condition_metadata: dict[str, Any] = {
                     "image_name": image_name,
+                    "source_image_path": original_reference,
+                    "source_image_hash": source_digest,
+                    "attempt_id": attempt_id,
                     "noise_level": level,
                     "noise_method": NOISE_METHOD,
                     "noise_sigma": sigma,
                     "reproducibility_seed": reproducibility_seed,
                     "image_width": "",
                     "image_height": "",
+                    "model_checkpoint": PIPELINE_METADATA["model_checkpoint"],
+                    "model_sha256": PIPELINE_METADATA["model_sha256"],
+                    "scene_associations_sha256": PIPELINE_METADATA[
+                        "activation_scene_associations_sha256"
+                    ],
+                    "preprocessing": PIPELINE_METADATA["preprocessing"],
                 }
                 prediction_row: dict[str, Any] = {**condition_metadata,
                                                    "processing_status": "failed", "error_message": ""}
                 summary_row: dict[str, Any] = {**condition_metadata,
                                                 "original_image_reference": original_reference, "noisy_image_reference": "",
-                                                "predicted_class": "", "predicted_class_score": "", "number_of_concepts": 0,
-                                                "concept_results_reference": "", "gradcam_output_reference": "",
-                                                "concept_visualization_reference": "", "gradcam_visualization_reference": "",
+                                                "predicted_class": "", "predicted_class_name": "",
+                                                "predicted_class_score": "", "number_of_activation_rows": 0,
+                                                "activation_results_reference": "", "gradcam_output_reference": "",
+                                                "activation_visualization_reference": "", "gradcam_visualization_reference": "",
                                                 "processing_status": "failed", "error_details": ""}
                 try:
                     # Save a consistently named image for every condition,
@@ -373,7 +453,7 @@ def run_batch(input_dir: Path, output_dir: Path, seed: int, *, new_only: bool = 
                     with Image.open(source_path) as source:
                         generated = apply_rgb_noise(source, level, np.random.default_rng(reproducibility_seed))
                     noisy_artifact_path = artifact_path(
-                        dirs["noisy"], f"{artifact_base_name}_noise_{level}.jpg"
+                        dirs["noisy"], f"{artifact_base_name}_noise_{level}.jpg", collision_suffix
                     )
                     # JPEG cannot retain alpha: transparent PNGs are composited
                     # on white before quality-95 encoding. JPEG may add
@@ -389,55 +469,58 @@ def run_batch(input_dir: Path, output_dir: Path, seed: int, *, new_only: bool = 
                         condition_metadata.update({"image_width": width, "image_height": height})
                         prediction_row.update({"image_width": width, "image_height": height})
                         summary_row.update({"image_width": width, "image_height": height})
-                        rgb = inference_image.convert("RGB").resize((224, 224))
-                        inference_input = np.expand_dims(np.asarray(rgb, dtype=np.float32) / 255.0, axis=0)
+                    inference_input = preprocess_image_path(condition_path)
                     scores = model.predict(inference_input, verbose=0)[0]
                     predicted_index = int(np.argmax(scores))
-                    prediction_row.update({"predicted_class": CLASS_NAMES[predicted_index],
+                    predicted_record = class_record(predicted_index)
+                    prediction_row.update({"predicted_class": predicted_record["class_id"],
+                                           "predicted_class_name": predicted_record["display_name"],
                                            "predicted_class_score": float(scores[predicted_index]),
                                            **{name: float(scores[index]) for index, name in enumerate(CLASS_NAMES)}})
 
-                    # Use the existing UI's concept-specific preprocessing,
-                    # not the separate Grad-CAM/Pillow preprocessing above.
-                    activations = activations_model.predict(concept_input_for(condition_path), verbose=0)
-                    rows = concept_rows_for(activations, calibration, condition_metadata)
-                    concept_path = artifact_path(
-                        dirs["concepts"], f"{artifact_base_name}_noise_{level}.json"
+                    activations = activations_model.predict(inference_input, verbose=0)
+                    rows = activation_rows_for_batch(activations, condition_metadata)
+                    activation_path = artifact_path(
+                        dirs["activations"], f"{artifact_base_name}_noise_{level}.json", collision_suffix
                     )
-                    concept_path.write_text(json.dumps(rows, indent=2, default=str), encoding="utf-8")
-                    concept_reference = relative_reference(concept_path, output_dir)
+                    activation_path.write_text(json.dumps(rows, indent=2, default=str), encoding="utf-8")
+                    activation_reference = relative_reference(activation_path, output_dir)
                     display_name = f"{relative_path.name} (noise {level}%)"
-                    concept_visualization_path = artifact_path(
-                        dirs["concept_visualizations"],
-                        f"{artifact_base_name}_noise_{level}_concepts.png",
+                    activation_visualization_path = artifact_path(
+                        dirs["activation_visualizations"],
+                        f"{artifact_base_name}_noise_{level}_activations.png",
+                        collision_suffix,
                     )
-                    save_concept_visualization(condition_path, display_name, rows, concept_visualization_path)
-                    concept_visualization_reference = relative_reference(concept_visualization_path, output_dir)
+                    save_activation_visualization(condition_path, display_name, rows, activation_visualization_path)
+                    activation_visualization_reference = relative_reference(activation_visualization_path, output_dir)
 
                     gradcam = generate_gradcam(condition_path, model=model)
                     overlay_path = artifact_path(
-                        dirs["gradcam"], f"{artifact_base_name}_noise_{level}_gradcam.png"
+                        dirs["gradcam"], f"{artifact_base_name}_noise_{level}_gradcam.png", collision_suffix
                     )
                     gradcam["overlay"].save(overlay_path)
                     gradcam_reference = relative_reference(overlay_path, output_dir)
                     gradcam_visualization_path = artifact_path(
                         dirs["gradcam_visualizations"],
                         f"{artifact_base_name}_noise_{level}_gradcam.png",
+                        collision_suffix,
                     )
                     save_gradcam_visualization(condition_path, display_name, gradcam, gradcam_visualization_path)
                     gradcam_visualization_reference = relative_reference(gradcam_visualization_path, output_dir)
-                    # Append concept rows only once the entire condition has
+                    # Append activation rows only once the entire condition has
                     # succeeded, so a Grad-CAM failure cannot create duplicate
-                    # concept CSV records when this level is retried.
+                    # activation CSV records when this level is retried.
                     for row in rows:
-                        concept_writer.writerow(row)
+                        activation_writer.writerow(row)
                     # Keep the prediction source consistent with existing model.predict.
                     prediction_row["processing_status"] = "success"
                     summary_row.update({"predicted_class": prediction_row["predicted_class"],
+                                        "predicted_class_name": prediction_row["predicted_class_name"],
                                         "predicted_class_score": prediction_row["predicted_class_score"],
-                                        "number_of_concepts": len(rows), "concept_results_reference": concept_reference,
+                                        "number_of_activation_rows": len(rows),
+                                        "activation_results_reference": activation_reference,
                                         "gradcam_output_reference": gradcam_reference,
-                                        "concept_visualization_reference": concept_visualization_reference,
+                                        "activation_visualization_reference": activation_visualization_reference,
                                         "gradcam_visualization_reference": gradcam_visualization_reference,
                                         "processing_status": "success"})
                 except Exception as exc:  # Per-case failure is deliberately non-fatal.
@@ -452,6 +535,13 @@ def run_batch(input_dir: Path, output_dir: Path, seed: int, *, new_only: bool = 
                     "status": status,
                     "attempt_id": attempt_id,
                     "error_message": prediction_row["error_message"],
+                    "artifacts": {
+                        "noisy_image": noisy_reference,
+                        "activation_results": activation_reference,
+                        "gradcam_overlay": gradcam_reference,
+                        "activation_visualization": activation_visualization_reference,
+                        "gradcam_visualization": gradcam_visualization_reference,
+                    },
                 }
                 record["completed_noise_levels"] = sorted(
                     int(item) for item, state in record["conditions"].items()
@@ -465,8 +555,9 @@ def run_batch(input_dir: Path, output_dir: Path, seed: int, *, new_only: bool = 
                 save_manifest(output_dir, manifest)
     finally:
         prediction_file.close()
-        concept_file.close()
+        activation_file.close()
         summary_file.close()
+        close_batch_logging()
 
 
 def parse_args() -> argparse.Namespace:

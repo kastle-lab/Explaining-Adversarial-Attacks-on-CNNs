@@ -1,34 +1,49 @@
 #!/usr/bin/env python
-# coding: utf-8
+"""Inference, 64-neuron profiling, and Grad-CAM helpers for ConceptLens."""
 
-# In[13]:
+from __future__ import annotations
 
-
-import numpy as np
-import os
-import PIL
-import PIL.Image
-import tensorflow as tf
-import pathlib
-import matplotlib.pyplot as plt
-import shutil
-import distutils.dir_util
-import matplotlib.image as mpimg
-import pandas as pd
-from tensorflow.keras.preprocessing import image
-from tensorflow.keras.models import load_model
-from tensorflow.keras.models import Model
-import collections
+from functools import lru_cache
 from io import BytesIO
 from pathlib import Path
-import streamlit as st
-#from flask import Flask, request, render_template, redirect, url_for
+from typing import Any
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+from PIL import Image
+from tensorflow.keras.models import Model
+
+from conceptlens_model import (
+    PROJECT_ROOT,
+    activation_model_for,
+    class_record,
+    file_sha256,
+    get_model_config,
+    layer_shape,
+    load_conceptlens_model,
+    prediction_records,
+    preprocess_image_path,
+)
 
 
-MODEL_PATH = Path(__file__).resolve().parent / 'model_resnet50V2_10classes_retest2023June.h5'
-CLASS_NAMES = [
-    'bathroom', 'bedroom', 'building facade', 'conference room', 'dining room',
-    'highway', 'kitchen', 'living room', 'skyscraper', 'street'
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png"}
+ACTIVATION_COLUMNS = [
+    "Neuron ID",
+    "Activation Value",
+    "Reference Maximum",
+    "Reference Percentage",
+    "Reference Available",
+    "Scene Association",
+    "Primary Scene Association ID",
+    "Association AUC",
+    "Secondary Scene Association ID",
+    "Secondary Association AUC",
+    "AUC Margin",
+    "Evidence Tier",
+    "Association Available",
+    "Image Name",
 ]
 
 
@@ -36,493 +51,295 @@ class GradCAMError(RuntimeError):
     """Raised when a spatial Grad-CAM explanation cannot be generated."""
 
 
-def plot_concept_bars(axis, concept_results):
-    """Render the exact ConceptLens bar-chart data treatment used in the UI."""
-    sorted_results = concept_results.sort_values(
-        by='Non-Target Percentage', ascending=False
-    )
-    axis.barh(sorted_results['Detected Concept'], sorted_results['Non-Target Percentage'])
-    axis.set_xlabel('Error-rate Percentage')
+class ActivationAnalysisError(RuntimeError):
+    """Raised when the verified 64-neuron representation is unavailable."""
 
 
-def render_concept_visualization(input_image, image_name, concept_results):
-    """Create a standalone PNG-ready version of the Streamlit concept section.
+def figure_to_png_bytes(figure: Any) -> bytes:
+    image_bytes = BytesIO()
+    figure.savefig(image_bytes, format="png", dpi=150, facecolor="white")
+    image_bytes.seek(0)
+    return image_bytes.getvalue()
 
-    Streamlit itself lays out widgets in HTML, so a standalone file cannot use
-    its DOM/CSS. This figure mirrors its heading, two-column proportions,
-    caption placement, and the shared chart renderer above.
+
+@lru_cache(maxsize=1)
+def load_activation_reference() -> pd.DataFrame:
+    path = PROJECT_ROOT / get_model_config()["activation_reference"]
+    frame = pd.read_csv(path)
+    expected_ids = list(range(get_model_config()["activation_units"]))
+    if frame["neuron_id"].tolist() != expected_ids:
+        raise ActivationAnalysisError("Activation reference must contain neuron IDs 0 through 63.")
+    return frame
+
+
+@lru_cache(maxsize=1)
+def load_activation_scene_associations() -> pd.DataFrame:
+    config = get_model_config()
+    path = PROJECT_ROOT / config["activation_scene_associations"]
+    if file_sha256(path) != config["activation_scene_associations_sha256"].upper():
+        raise ActivationAnalysisError(f"Activation scene-association hash mismatch: {path}")
+    frame = pd.read_csv(path, keep_default_na=False)
+    expected_ids = list(range(config["activation_units"]))
+    if frame["neuron_id"].tolist() != expected_ids:
+        raise ActivationAnalysisError("Scene associations must contain neuron IDs 0 through 63.")
+    allowed_tiers = {"high", "moderate", "ambiguous", "inactive"}
+    if not set(frame["evidence_tier"]).issubset(allowed_tiers):
+        raise ActivationAnalysisError("Scene associations contain an unknown evidence tier.")
+    return frame
+
+
+def activation_rows_for(
+    activations: np.ndarray, image_name: str = "", *, include_all: bool = True, top_n: int = 10
+) -> pd.DataFrame:
+    """Describe new-model neurons without assigning legacy semantics.
+
+    Reference percentages compare each value with the maximum observed in the
+    supplied 1,921-image Stage 1 activation CSV. High/moderate-evidence scene
+    associations come from descriptive one-vs-rest AUC analysis of the same
+    reference. Neither value is a probability, error rate, object concept, or
+    causal claim about neuron identity.
     """
-    figure = plt.figure(figsize=(15, 8), facecolor='white')
-    figure.text(0.035, 0.965, 'Detected Concepts and Error-rate Percentages',
-                ha='left', va='top', fontsize=19, fontweight='bold', color='#262730')
-    grid = figure.add_gridspec(1, 2, left=0.035, right=0.97, bottom=0.10,
-                               top=0.89, width_ratios=[1, 2], wspace=0.22)
+    values = np.asarray(activations, dtype=np.float64).reshape(-1)
+    expected = get_model_config()["activation_units"]
+    if values.shape != (expected,):
+        raise ActivationAnalysisError(f"Expected {expected} activations, received {values.shape}.")
+    if not np.isfinite(values).all():
+        raise ActivationAnalysisError("The activation vector contains non-finite values.")
+
+    reference = load_activation_reference()
+    associations = load_activation_scene_associations()
+    maxima = reference["reference_max"].to_numpy(dtype=np.float64)
+    available = maxima > 0
+    relative = np.full(expected, np.nan, dtype=np.float64)
+    relative[available] = values[available] / maxima[available] * 100.0
+    frame = pd.DataFrame(
+        {
+            "Neuron ID": np.arange(expected, dtype=int),
+            "Activation Value": values,
+            "Reference Maximum": maxima,
+            "Reference Percentage": relative,
+            "Reference Available": available,
+            "Scene Association": associations["primary_scene_display"],
+            "Primary Scene Association ID": associations["primary_scene"],
+            "Association AUC": pd.to_numeric(associations["primary_auc"], errors="coerce"),
+            "Secondary Scene Association ID": associations["secondary_scene"],
+            "Secondary Association AUC": pd.to_numeric(
+                associations["secondary_auc"], errors="coerce"
+            ),
+            "AUC Margin": pd.to_numeric(associations["auc_margin"], errors="coerce"),
+            "Evidence Tier": associations["evidence_tier"],
+            "Association Available": associations["evidence_tier"].isin({"high", "moderate"}),
+            "Image Name": image_name,
+        }
+    )
+    if include_all:
+        return frame
+    return (
+        frame[frame["Reference Available"] & (frame["Activation Value"] > 0)]
+        .sort_values(["Reference Percentage", "Activation Value"], ascending=False)
+        .head(top_n)
+        .reset_index(drop=True)
+    )
+
+
+def plot_activation_bars(axis: Any, activation_results: pd.DataFrame, top_n: int = 10) -> None:
+    filtered = (
+        activation_results[
+            activation_results["Reference Available"]
+            & (activation_results["Activation Value"] > 0)
+        ]
+        .sort_values(["Reference Percentage", "Activation Value"], ascending=False)
+        .head(top_n)
+        .sort_values("Reference Percentage", ascending=True)
+    )
+    if filtered.empty:
+        axis.text(0.5, 0.5, "No positive calibrated activations", ha="center", va="center")
+    else:
+        labels = []
+        for _, row in filtered.iterrows():
+            label = f"Neuron {int(row['Neuron ID'])}"
+            if row["Association Available"] and row["Scene Association"]:
+                label += f" - {row['Scene Association']}"
+            labels.append(label)
+        axis.barh(
+            labels,
+            filtered["Reference Percentage"],
+        )
+    axis.set_xlabel("Activation as % of Stage 1 reference maximum")
+
+
+def render_activation_visualization(
+    input_image: Image.Image, image_name: str, activation_results: pd.DataFrame
+) -> Any:
+    figure = plt.figure(figsize=(15, 8), facecolor="white")
+    figure.text(
+        0.035, 0.965, "64-Neuron Scene-Association Profile", ha="left", va="top",
+        fontsize=19, fontweight="bold", color="#262730"
+    )
+    figure.text(
+        0.035,
+        0.925,
+        "Supported labels are statistical scene associations; legacy object concepts/error rates remain unavailable.",
+        ha="left",
+        va="top",
+        fontsize=10,
+        color="#6c757d",
+    )
+    grid = figure.add_gridspec(
+        1, 2, left=0.035, right=0.97, bottom=0.10, top=0.86, width_ratios=[1, 2], wspace=0.22
+    )
     image_axis = figure.add_subplot(grid[0, 0])
     image_axis.imshow(input_image)
     image_axis.set_xticks([])
     image_axis.set_yticks([])
-    image_axis.set_xlabel(image_name, fontsize=10, color='#6c757d', labelpad=10)
+    image_axis.set_xlabel(image_name, fontsize=10, color="#6c757d", labelpad=10)
     for spine in image_axis.spines.values():
         spine.set_visible(False)
-
     chart_axis = figure.add_subplot(grid[0, 1])
-    if concept_results.empty:
-        chart_axis.text(0.5, 0.5, 'No concepts detected', ha='center', va='center',
-                        color='#6c757d', transform=chart_axis.transAxes)
-        chart_axis.set_xlabel('Error-rate Percentage')
-    else:
-        plot_concept_bars(chart_axis, concept_results)
+    plot_activation_bars(chart_axis, activation_results)
     return figure
 
 
-def render_gradcam_visualization(input_image, image_name, gradcam_result):
-    """Create a standalone PNG-ready version of the Streamlit Grad-CAM section."""
-    figure = plt.figure(figsize=(15, 9), facecolor='white')
-    figure.text(0.035, 0.965, 'Grad-CAM Saliency Map', ha='left', va='top',
-                fontsize=19, fontweight='bold', color='#262730')
+def render_gradcam_visualization(
+    input_image: Image.Image, image_name: str, gradcam_result: dict[str, Any]
+) -> Any:
+    figure = plt.figure(figsize=(15, 9), facecolor="white")
     figure.text(
-        0.035, 0.922,
-        'ConceptLens describes the 64-neuron concept representation. '
-        'Grad-CAM uses the same scene classifier to highlight regions that '
-        'influenced its predicted class score.',
-        ha='left', va='top', fontsize=10, color='#6c757d'
+        0.035, 0.965, "Grad-CAM Saliency Map", ha="left", va="top", fontsize=19,
+        fontweight="bold", color="#262730"
     )
-    figure.text(0.035, 0.858, image_name, ha='left', va='top',
-                fontsize=14, fontweight='bold', color='#262730')
     figure.text(
-        0.035, 0.824,
-        f"Predicted Class: {gradcam_result['predicted_class']}  |  "
-        f"Prediction Score: {gradcam_result['prediction_score']:.4f}",
-        ha='left', va='top', fontsize=12, color='#262730'
+        0.035,
+        0.922,
+        "Grad-CAM highlights spatial regions that influenced the 50-class scene prediction.",
+        ha="left",
+        va="top",
+        fontsize=10,
+        color="#6c757d",
     )
-    grid = figure.add_gridspec(1, 2, left=0.035, right=0.97, bottom=0.08,
-                               top=0.76, wspace=0.08)
+    figure.text(0.035, 0.858, image_name, ha="left", va="top", fontsize=14, fontweight="bold")
+    figure.text(
+        0.035,
+        0.824,
+        f"Predicted class: {gradcam_result['predicted_display_name']}  |  "
+        f"Probability: {gradcam_result['prediction_score']:.2%}",
+        ha="left",
+        va="top",
+        fontsize=12,
+    )
+    grid = figure.add_gridspec(1, 2, left=0.035, right=0.97, bottom=0.08, top=0.76, wspace=0.08)
     original_axis = figure.add_subplot(grid[0, 0])
     original_axis.imshow(input_image)
     original_axis.set_xticks([])
     original_axis.set_yticks([])
-    original_axis.set_xlabel('Original Image', fontsize=10, color='#6c757d', labelpad=10)
+    original_axis.set_xlabel("Original Image", fontsize=10, color="#6c757d", labelpad=10)
     overlay_axis = figure.add_subplot(grid[0, 1])
-    overlay_axis.imshow(gradcam_result['overlay'])
+    overlay_axis.imshow(gradcam_result["overlay"])
     overlay_axis.set_xticks([])
     overlay_axis.set_yticks([])
-    overlay_axis.set_xlabel('Grad-CAM Overlay', fontsize=10, color='#6c757d', labelpad=10)
+    overlay_axis.set_xlabel("Grad-CAM Overlay", fontsize=10, color="#6c757d", labelpad=10)
     for axis in (original_axis, overlay_axis):
         for spine in axis.spines.values():
             spine.set_visible(False)
     return figure
 
 
-def figure_to_png_bytes(figure):
-    """Serialize one shared visualization figure for Streamlit downloads."""
-    image_bytes = BytesIO()
-    figure.savefig(image_bytes, format='png', dpi=150, facecolor='white')
-    image_bytes.seek(0)
-    return image_bytes.getvalue()
-
-
-@st.cache_resource
-def load_conceptlens_model():
-    """Load the existing inference model once per Streamlit process."""
-    if not MODEL_PATH.is_file():
-        raise FileNotFoundError(f'ConceptLens model was not found: {MODEL_PATH}')
-    return load_model(MODEL_PATH, compile=False)
-
-
-def _layer_shape(layer):
-    """Return a readable output shape without assuming a single output tensor."""
-    shape = getattr(layer, 'output_shape', None)
-    return tuple(shape) if shape is not None else None
-
-
-def find_gradcam_layer(model):
-    """Find the model's final spatial feature map, or raise a useful diagnostic.
-
-    The loaded ConceptLens model is expected to contain ``post_relu`` at layer
-    189 with shape ``(None, 7, 7, 2048)``.  Verify that exact, connected layer
-    first; the fallback keeps the helper useful if a compatible ConceptLens
-    checkpoint is later saved with different layer names.
-    """
+def find_gradcam_layer(model: Any) -> Any:
+    configured_name = get_model_config()["gradcam_layer"]
     try:
-        post_relu = model.get_layer('post_relu')
+        configured = model.get_layer(configured_name)
     except (AttributeError, ValueError):
-        post_relu = None
+        configured = None
+    if configured is not None:
+        shape = layer_shape(configured)
+        if len(shape) == 4 and shape[1] not in (None, 1) and shape[2] not in (None, 1):
+            return configured
 
-    if post_relu is not None:
-        shape = _layer_shape(post_relu)
-        if (
-            post_relu in model.layers
-            and len(model.layers) > 189
-            and model.layers[189] is post_relu
-            and shape is not None
-            and len(shape) == 4
-            and shape[1:] == (7, 7, 2048)
-        ):
-            return post_relu
-
-    candidates = []
     for layer in reversed(model.layers):
-        shape = _layer_shape(layer)
-        # Exclude pooling outputs such as (None, 1, 1, 2048): they retain a
-        # rank-4 shape but no longer contain meaningful spatial locations.
-        if (
-            shape is not None
-            and len(shape) == 4
-            and shape[1] is not None
-            and shape[2] is not None
-            and shape[1] > 1
-            and shape[2] > 1
-        ):
-            candidates.append((layer, shape))
-
-    if not candidates:
-        diagnostic = ', '.join(
-            f'{layer.name}: {_layer_shape(layer)}' for layer in model.layers[-12:]
-        )
-        raise GradCAMError(
-            'No 4D convolutional feature map was found for Grad-CAM. '
-            f'Final model layers: {diagnostic}'
-        )
-
-    layer, shape = candidates[0]
-    if shape[1] is None or shape[2] is None or shape[3] is None:
-        raise GradCAMError(
-            f"Grad-CAM layer '{layer.name}' has an unsupported output shape: {shape}"
-        )
-    return layer
+        shape = layer_shape(layer)
+        if len(shape) == 4 and shape[1] not in (None, 1) and shape[2] not in (None, 1):
+            return layer
+    raise GradCAMError("No connected spatial feature layer is available for Grad-CAM.")
 
 
-def generate_gradcam(image_path, model=None):
-    """Generate a normalized Grad-CAM heatmap and overlay for one JPEG or PNG image.
-
-    The returned heatmap has the original image's height and width, contains
-    values in [0, 1].  Prediction and gradients both come from the same loaded
-    ConceptLens ResNet50V2 classifier.
-    """
+def generate_gradcam(image_path: Path | str, model: Any = None) -> dict[str, Any]:
     path = Path(image_path)
-    if path.suffix.lower() not in {'.jpg', '.jpeg', '.png'}:
-        raise GradCAMError('Grad-CAM supports JPEG and PNG images (.jpg, .jpeg, or .png).')
+    if path.suffix.lower() not in IMAGE_EXTENSIONS:
+        raise GradCAMError("Grad-CAM supports JPEG and PNG images.")
     if not path.is_file():
-        raise GradCAMError(f'Image could not be loaded: {path}')
-
+        raise GradCAMError(f"Image could not be loaded: {path}")
     try:
-        original_image = PIL.Image.open(path).convert('RGB')
+        original_image = Image.open(path).convert("RGB")
     except (OSError, ValueError) as exc:
-        raise GradCAMError(f'Image could not be loaded: {path}') from exc
-
-    original_array = np.asarray(original_image)
-    resized_image = original_image.resize((224, 224))
-    image_array = np.asarray(resized_image, dtype=np.float32)
-    conceptlens_input = np.expand_dims(image_array / 255.0, axis=0)
+        raise GradCAMError(f"Image could not be loaded: {path}") from exc
 
     if model is None:
-        try:
-            model = load_conceptlens_model()
-        except (OSError, ValueError, FileNotFoundError) as exc:
-            raise GradCAMError(f'ConceptLens model could not be loaded: {exc}') from exc
-    if len(model.output_shape) != 2 or model.output_shape[-1] != len(CLASS_NAMES):
-        raise GradCAMError(
-            f'Expected a 10-class model output, but received {model.output_shape}.'
-        )
-
+        model = load_conceptlens_model()
+    conceptlens_input = preprocess_image_path(path)
     gradcam_layer = find_gradcam_layer(model)
     try:
-        grad_model = Model(
-            model.inputs, [gradcam_layer.output, model.output]
-        )
+        grad_model = Model(model.inputs, [gradcam_layer.output, model.output])
     except (ValueError, TypeError) as exc:
-        raise GradCAMError(
-            f"Layer '{gradcam_layer.name}' is not connected to the classifier output."
-        ) from exc
+        raise GradCAMError(f"Layer '{gradcam_layer.name}' is not connected to model output.") from exc
 
     with tf.GradientTape() as tape:
         feature_maps, predictions = grad_model(conceptlens_input, training=False)
         predicted_index = tf.argmax(predictions[0])
         class_score = predictions[:, predicted_index]
     gradients = tape.gradient(class_score, feature_maps)
-
-    conceptlens_index = int(predicted_index.numpy())
-
     if gradients is None:
-        raise GradCAMError(
-            f"No gradient was available from the classifier to '{gradcam_layer.name}'."
-        )
-    if len(feature_maps.shape) != 4:
-        raise GradCAMError(
-            f"Grad-CAM layer '{gradcam_layer.name}' did not produce a 4D feature map."
-        )
+        raise GradCAMError(f"No gradient was available at '{gradcam_layer.name}'.")
 
     pooled_gradients = tf.reduce_mean(gradients, axis=(0, 1, 2))
-    weighted_feature_maps = feature_maps[0] * pooled_gradients
-    heatmap = tf.reduce_sum(weighted_feature_maps, axis=-1)
+    heatmap = tf.reduce_sum(feature_maps[0] * pooled_gradients, axis=-1)
     heatmap = tf.maximum(heatmap, 0)
     maximum = tf.reduce_max(heatmap)
     heatmap = tf.where(maximum > 0, heatmap / maximum, tf.zeros_like(heatmap))
 
-    heatmap_image = PIL.Image.fromarray(
-        np.uint8(heatmap.numpy() * 255), mode='L'
-    ).resize(original_image.size, resample=PIL.Image.Resampling.BILINEAR)
-    resized_heatmap = np.asarray(heatmap_image, dtype=np.float32) / 255.0
-    resized_heatmap = np.clip(resized_heatmap, 0.0, 1.0)
-
-    heatmap_rgb = plt.colormaps['jet'](resized_heatmap)[..., :3]
-    overlay_array = np.uint8(
-        np.clip(0.60 * original_array + 0.40 * heatmap_rgb * 255, 0, 255)
+    heatmap_image = Image.fromarray(np.uint8(heatmap.numpy() * 255), mode="L").resize(
+        original_image.size, resample=Image.Resampling.BILINEAR
     )
+    resized_heatmap = np.asarray(heatmap_image, dtype=np.float32) / 255.0
+    heatmap_rgb = plt.colormaps["jet"](resized_heatmap)[..., :3]
+    original_array = np.asarray(original_image)
+    overlay_array = np.uint8(np.clip(0.60 * original_array + 0.40 * heatmap_rgb * 255, 0, 255))
 
+    index = int(predicted_index.numpy())
+    scores = predictions[0].numpy()
+    record = class_record(index)
     return {
-        'predicted_class': CLASS_NAMES[conceptlens_index],
-        'prediction_score': float(predictions[0, conceptlens_index].numpy()),
-        'heatmap': resized_heatmap,
-        'overlay': PIL.Image.fromarray(overlay_array),
-        'layer_name': gradcam_layer.name,
+        "predicted_index": index,
+        "predicted_class": record["class_id"],
+        "predicted_display_name": record["display_name"],
+        "prediction_score": float(scores[index]),
+        "top_predictions": prediction_records(scores),
+        "probabilities": scores,
+        "heatmap": resized_heatmap,
+        "overlay": Image.fromarray(overlay_array),
+        "layer_name": gradcam_layer.name,
     }
 
 
+def get_denseActivations(folder_path: Path | str) -> pd.DataFrame:
+    folder = Path(folder_path)
+    image_paths = sorted(
+        path for path in folder.rglob("*") if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+    )
+    if not image_paths:
+        return pd.DataFrame(columns=ACTIVATION_COLUMNS + ["Class Name"])
 
-# In[14]:
-
-
-def get_denseActivations(folder_path):
-    print(folder_path)
-    model = load_conceptlens_model()
-    
-    layer_outputs = [layer.output for layer in model.layers[-3:-2]]
-    feature_map_model = Model(inputs=model.input, outputs=layer_outputs)
-    
-    test_directory = folder_path
-    new_classes = [name for name in os.listdir(test_directory)
-    if os.path.isdir(os.path.join(test_directory, name)) and not name.startswith('.')]
-    
-    rescale_generator = image.ImageDataGenerator(rescale=1./255)
-    # Load the test images for the new classes
-    test_images = []
-    filenames = []
-    class_names = []
-    print(new_classes)
-    for class_name in new_classes:
-        class_directory = os.path.join(test_directory, class_name)
-        for image_name in os.listdir(class_directory):
-            image_path = os.path.join(class_directory, image_name)
-            img = image.load_img(image_path, target_size=(224, 224))
-            img = image.img_to_array(img)
-            img = np.expand_dims(img, axis=0)
-            img = rescale_generator.standardize(img)
-            test_images.append(img)
-            filenames.append(image_name)
-            class_names.append(class_name)
-
-    # Concatenate the test images into a single array
-    test_images = np.concatenate(test_images)
-    print("Test images shape:", test_images.shape)
-
-    # Perform predictions for the new test images
-    predIdxs = feature_map_model.predict(test_images)
+    activation_model = activation_model_for(load_conceptlens_model())
+    inputs = np.concatenate([preprocess_image_path(path) for path in image_paths], axis=0)
+    activations = activation_model.predict(inputs, verbose=0)
+    frames = []
+    for path, vector in zip(image_paths, activations):
+        frame = activation_rows_for(vector, path.name)
+        frame["Class Name"] = path.parent.name
+        frames.append(frame)
+    return pd.concat(frames, ignore_index=True)
 
 
-    # Get classes by max element in predIdxs (as a list)
-    classes = list(np.argmax(predIdxs, axis=1))
-
-    # Get filenames
-    #filenames = test_dataset.filenames
-
-    # Create a dataframe with predIdxs, filenames, and classes
-    df=pd.DataFrame(predIdxs)
-    df['Class_names'] = class_names
-    df['filenames'] = filenames
-    return df
-    
-
-
-# In[15]:
-
-
-def get_base_activations():
-    calibration_path = Path(__file__).resolve().parent / 'activation_cutoffs_ensemble.xlsx'
-    df = pd.read_excel(calibration_path, sheet_name='concepts_wrt_neuron')
-    df = df.dropna()
-   
-    ans = collections.defaultdict(list)
-
-    #create a default dictionary with concept as key and corresponding rows as values.
-    #concepts with multiple rows will have value_list > 1 (for example "building")
-    for index, row in df.iterrows():
-        key = row['concepts'].strip()
-        values = row.iloc[1:].tolist()
-        if isinstance(values[0], str) and ',' in values[0]:
-            values[0] = list(map(int, values[0].strip().split(',')))
-        ans[key].append(values)
-    #print(ans)
-    return ans
-
-
-# In[16]:
-
-
-# function to categorize the calculated percentage and return the non-target value
-# reading out from the activation_cutoffs_ensemble.xlxs sheet
-def calculate_nonTarget(percentage, values_non_targ, position=0):
-    if 0 <= percentage < 20:
-        #print(f" 0% {values_non_targ['value_non_targ_0'][position]}")
-        return percentage, values_non_targ['value_non_targ_0'][position]
-    elif 20 <= percentage < 40:
-        #print(f" 20% {values_non_targ['value_non_targ_20'][position]}")
-        return percentage, values_non_targ['value_non_targ_20'][position]        
-    elif 40 <= percentage < 60:
-        #print(f" 40% {values_non_targ['value_non_targ_40'][position]}")
-        return percentage, values_non_targ['value_non_targ_40'][position]    
-    elif percentage > 60:
-        #print(f" 60% {values_non_targ['value_non_targ_60'][position]}")
-        return percentage, values_non_targ['value_non_targ_60'][position] 
-
-
-# In[17]:
-
-
-# function to calculate percentage based on activation value and highest activation value
-# and pass it on to the calculate_nonTarget.
-def calculate_percentage(activation_value, neuron_number, values_non_targ, position=0):
-    highest_activation_google = [
-        10.211055, 11.088214, 2, 9.033163, 1, 1, 9.431637, 9.883725, 11.348856, 0, 1, 7.9009895, 9.530197, 1, 12.148633, 1, 
-        11.23226, 6.330751, 8.958463, 9.2957325, 7.8736634, 1, 14.670559, 7.885283, 2, 3, 7.929167, 7.527469, 10.577261, 
-        12.874766, 11.085954, 10.013984, 2, 6.3215637, 10.973764, 5.072766, 10.681126, 7.543815, 8.990902, 9.668447, 
-        11.757579, 6.854899, 9.289408, 15.320628, 11.24213, 2, 8.746855, 1, 11.035124, 11.126115, 12.365238, 12.115424, 0, 
-        9.32957, 12.148235, 3, 10.9385, 9.844189, 4.989685, 7.730961, 4.3857574, 5.6195107, 8.790374, 8.32669
-    ]
-
-    # Create a DataFrame with headers starting from 0
-    df_highest_activations = pd.DataFrame([highest_activation_google], columns=range(len(highest_activation_google)))
-
-    highest_activation = df_highest_activations[neuron_number].item()
-    percentage = (activation_value / highest_activation) * 100
-#     print(f" Neuron number {neuron_number}"
-#           f" with activation value {activation_value} and highest activation value {highest_activation}" 
-#           f" calculated percentage is {percentage}")
-
-    return calculate_nonTarget(percentage, values_non_targ, position)   
-
-
-# In[18]:
-
-
-# for each concept in activation_cutoffs_ensemble.xlxs sheet get the activation for the neuron number
-# calculate percentage by using calculate_percentage and 
-# calculate non-target value using calculate_nonTarget
-
-def process_activation_data(given_activations, ans):
-	detected_concepts_list = []
-	non_target_percentage_list = []
-	for concept, values_list in ans.items():
-		detected_concepts = set()
-		min_non_target_percentage = []
-		# handles concepts activating to more than one neuron for example "building","bushes, bush"
-		if len(values_list) > 1:
-			min_non_target_percentage = []
-			target_values = [sublist[1] for sublist in values_list]
-			#print(target_values)
-			#collect the sublists of non-target values for >0, >20, >40, >60 corresponding to neuron numbers.
-			names = ['neuron_number','value_non_targ_0', 'value_non_targ_20', 'value_non_targ_40', 'value_non_targ_60']
-			values_non_targ_combined = {name: [sublist[i] for sublist in values_list] for name, i in zip(names, range(0, 9, 2))}
-			#print(f"values_non_targ_combined{values_non_targ_combined}")
-			for position, neuron_number in enumerate(values_non_targ_combined['neuron_number']):
-				# handle cases where neuron number are single cases, for example 0, 1, 16, 53
-				if not isinstance(neuron_number, (list, tuple)):
-					activation_value = given_activations[neuron_number].item()
-					if activation_value != 0 and max(target_values) > 80:
-						detected_concepts.add(concept)
-						_, non_targ_value = calculate_percentage(activation_value, neuron_number, values_non_targ_combined, position)
-						min_non_target_percentage.append(non_targ_value)
-				
-				# handle cases where neuron_number are of list form, for example [0,63] or [1,16,53]
-				else:
-					# create dict for each key(key is category for % : >0, >20, >40, >60) 
-					#and calculate non-targ for each value in list.
-					count_dict = {0: 0, 20: 0, 40: 0, 60: 0}
-					for value in set(neuron_number):
-						activation_value = given_activations[value].item()
-						if activation_value != 0 and max(target_values) > 80:
-							detected_concepts.add(concept)
-							percentage, non_targ_value = calculate_percentage(activation_value, value, values_non_targ_combined, position)
-							#print(f"percentage, non_targ_value{percentage, non_targ_value}")
-							# update count for the keys, where percentage < key 
-							#for example 33.45 -> update key 0, 20; for 40.01 update key 0,20,40
-							for key in count_dict.keys():
-								if key < percentage:
-									count_dict[key] += 1
-					#find the key with max count and return the key with greater number in case of ties.
-					max_key = max(count_dict, key=lambda k: (count_dict[k], k))
-					#print(f"max_key{max_key}")
-					#return non-target value based on the key percentage
-					non_targ_value_combined_result = calculate_nonTarget(max_key, values_non_targ_combined, position)
-					#print(f"non_targ_value_combined_result{non_targ_value_combined_result}")
-					# Check if the result is not None before attempting to unpack it
-					if non_targ_value_combined_result is not None:
-						_, non_targ_value_combined = non_targ_value_combined_result
-						min_non_target_percentage.append(non_targ_value_combined)
-						#print(f"min_non_target_percentage{min_non_target_percentage}")
-		# handle cases where neuron number are single cases, for example 0, 1, 16, 53
-		else:
-			target_values = values_list[0][1]
-			names = ['neuron_number','value_non_targ_0', 'value_non_targ_20', 'value_non_targ_40', 'value_non_targ_60']
-			values_non_targ_dict = {name: [values_list[0][i]] for name, i in zip(names, range(0, 9, 2))}
-			activation_value = given_activations[values_non_targ_dict['neuron_number'][0]].item()
-			if activation_value != 0 and target_values > 80:
-				detected_concepts.add(concept)
-				_, non_targ_value = calculate_percentage(activation_value, values_non_targ_dict['neuron_number'][0], values_non_targ_dict)
-				min_non_target_percentage.append(non_targ_value)
-		
-		#finally print the concept and the corresponding non-target values based on activations.
-		#print(f" Detected concept {printed_neuron_numbers}")
-		if min_non_target_percentage and detected_concepts:
-			# print(f" Detected concept {detected_concepts}")
-			# print(f" non-target % for {concept} is {min(min_non_target_percentage)}")
-			detected_concepts_list.append(detected_concepts.pop())
-			non_target_percentage_list.append(min(min_non_target_percentage))
-            
-	#print(detected_concepts_list, non_target_percentage_list)
-	return detected_concepts_list, non_target_percentage_list
-
-# In[21]:
-
-
-def image_processing_function(unique_folder_path):
-    activations_df = get_denseActivations(unique_folder_path)
-    
-    result_df = pd.DataFrame()
-
-    for index, row in activations_df.iterrows():
-        activations_subset = pd.DataFrame([row.tolist()], columns=range(len(activations_df.columns)))
-        class_name = activations_subset[64].item()
-        image_name = activations_subset[65].item()
-
-        # Assuming process_activation_data returns a tuple (result[0], result[1])
-        ans = get_base_activations()
-        result = process_activation_data(activations_subset, ans)
-
-        # Create a DataFrame from the results
-        row_result_df = pd.DataFrame({
-            'Detected Concept': result[0],
-            'Non-Target Percentage': result[1],
-            'Class Name': [class_name] * len(result[0]),
-            'Image Name': [image_name] * len(result[0])
-        })
-
-        # Concatenate the current row_result_df with the existing result_df
-        result_df = pd.concat([result_df, row_result_df], ignore_index=True)
-
-    # Display the final result DataFrame
-    # print(result_df)
-    # result_df.to_csv('analyzeActivations_demo.csv', index=False)
-    
-    return result_df
-
-
-
-
-
-
-# In[ ]:
-
-
+def image_processing_function(unique_folder_path: Path | str) -> pd.DataFrame:
+    return get_denseActivations(unique_folder_path)
 
 

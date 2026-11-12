@@ -1,0 +1,23 @@
+{
+  "created_for": "50-class ResNet50V2 migration",
+  "original_checkpoint_path": "model_resnet50V2_10classes_retest2023June.h5",
+  "checkpoint_backup": "backups/10-class/model_resnet50V2_10classes_retest2023June.h5",
+  "checkpoint_sha256": "33E5A76D96C7CCCB2D2F69FBE99594177438EB48B09A282136A4E95E6516C116",
+  "legacy_calibration_path": "activation_cutoffs_ensemble.xlsx",
+  "legacy_calibration_backup": "backups/10-class/activation_cutoffs_ensemble.xlsx",
+  "legacy_calibration_sha256": "CCA801579E5833ADF9B048270653464BD07B5AE241FF76E5B00538FD374874CF",
+  "class_labels": [
+    "bathroom",
+    "bedroom",
+    "building facade",
+    "conference room",
+    "dining room",
+    "highway",
+    "kitchen",
+    "living room",
+    "skyscraper",
+    "street"
+  ]
+}
+
+

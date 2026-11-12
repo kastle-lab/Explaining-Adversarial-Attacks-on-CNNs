@@ -1,9 +1,7 @@
 import os
-import time
 import uuid
 from io import BytesIO
 
-import matplotlib.pyplot as plt
 import streamlit as st
 from PIL import Image
 from streamlit_image_select import image_select
@@ -12,9 +10,6 @@ from demonstrator import (
     GradCAMError,
     figure_to_png_bytes,
     generate_gradcam,
-    image_processing_function,
-    plot_concept_bars,
-    render_concept_visualization,
     render_gradcam_visualization,
 )
 
@@ -33,46 +28,42 @@ def create_unique_folder(base_path):
 
 
 def image_to_png_bytes(image):
-    """Keep a Grad-CAM overlay available after a Streamlit rerun."""
     output = BytesIO()
     image.save(output, format="PNG")
     return output.getvalue()
 
 
 def build_analysis_results(unique_folder_path, class_folder_path):
-    """Run inference once and retain all display/download artifacts in memory."""
-    concepts_frame = image_processing_function(unique_folder_path)
+    """Run model work once and retain display/download artifacts for reruns."""
     results = []
 
     for image_name in sorted(os.listdir(class_folder_path)):
         image_path = os.path.join(class_folder_path, image_name)
         if not os.path.isfile(image_path):
             continue
-        concept_results = concepts_frame[concepts_frame["Image Name"] == image_name].copy()
-        with Image.open(image_path) as source_image:
-            concept_report = render_concept_visualization(source_image, image_name, concept_results)
-            concept_report_bytes = figure_to_png_bytes(concept_report)
-        concept_report.clear()
 
         result = {
             "image_path": image_path,
             "image_name": image_name,
-            "concept_results": concept_results,
-            "concept_visualization_bytes": concept_report_bytes,
             "gradcam_error": None,
         }
         try:
             gradcam_result = generate_gradcam(image_path)
             with Image.open(image_path) as source_image:
-                gradcam_report = render_gradcam_visualization(source_image, image_name, gradcam_result)
+                gradcam_report = render_gradcam_visualization(
+                    source_image, image_name, gradcam_result
+                )
                 gradcam_report_bytes = figure_to_png_bytes(gradcam_report)
             gradcam_report.clear()
-            result.update({
-                "predicted_class": gradcam_result["predicted_class"],
-                "prediction_score": gradcam_result["prediction_score"],
-                "gradcam_overlay_bytes": image_to_png_bytes(gradcam_result["overlay"]),
-                "gradcam_visualization_bytes": gradcam_report_bytes,
-            })
+            result.update(
+                {
+                    "predicted_class": gradcam_result["predicted_class"],
+                    "predicted_display_name": gradcam_result["predicted_display_name"],
+                    "prediction_score": gradcam_result["prediction_score"],
+                    "gradcam_overlay_bytes": image_to_png_bytes(gradcam_result["overlay"]),
+                    "gradcam_visualization_bytes": gradcam_report_bytes,
+                }
+            )
         except GradCAMError as exc:
             result["gradcam_error"] = str(exc)
         results.append(result)
@@ -80,50 +71,38 @@ def build_analysis_results(unique_folder_path, class_folder_path):
 
 
 def render_saved_results(results):
-    """Render session-state artifacts only; no model work occurs on reruns."""
     st.markdown("### Detected Concepts and Error-rate Percentages")
-    for result in results:
-        concept_results = result["concept_results"]
-        if concept_results.empty:
-            st.info(f"No concepts were detected for {result['image_name']}.")
-        else:
-            col1, col2 = st.columns([1, 2])
-            with col1:
-                st.image(result["image_path"], caption=result["image_name"], use_column_width=True)
-            with col2:
-                figure, axis = plt.subplots(figsize=(7, 5))
-                plot_concept_bars(axis, concept_results)
-                st.pyplot(figure)
-                plt.close(figure)
-
-        st.download_button(
-            "Download Concept Visualization",
-            data=result["concept_visualization_bytes"],
-            file_name=f"{os.path.splitext(result['image_name'])[0]}_concepts.png",
-            mime="image/png",
-            key=f"concept-download-{result['image_name']}",
-        )
+    st.info(
+        "Validated concept names and error-rate percentages are unavailable for "
+        "the 50-class model because the original 10-class calibration is incompatible."
+    )
 
     st.markdown("### Grad-CAM Saliency Map")
     st.caption(
-        "ConceptLens describes the 64-neuron concept representation. "
-        "Grad-CAM uses the same scene classifier to highlight regions that "
-        "influenced its predicted class score."
+        "ConceptLens uses Grad-CAM to highlight regions that influenced the "
+        "predicted scene-class score."
     )
     for result in results:
         if result["gradcam_error"]:
-            st.error(f"Could not generate Grad-CAM for {result['image_name']}: {result['gradcam_error']}")
+            st.error(
+                f"Could not generate prediction/Grad-CAM for {result['image_name']}: "
+                f"{result['gradcam_error']}"
+            )
             continue
         st.markdown(f"**{result['image_name']}**")
         st.write(
-            f"Predicted Class: {result['predicted_class']}  |  "
+            f"Predicted Class: {result['predicted_display_name']}  |  "
             f"Prediction Score: {result['prediction_score']:.4f}"
         )
         original_col, overlay_col = st.columns(2)
         with original_col:
             st.image(result["image_path"], caption="Original Image", use_column_width=True)
         with overlay_col:
-            st.image(result["gradcam_overlay_bytes"], caption="Grad-CAM Overlay", use_column_width=True)
+            st.image(
+                result["gradcam_overlay_bytes"],
+                caption="Grad-CAM Overlay",
+                use_column_width=True,
+            )
         st.download_button(
             "Download Grad-CAM Visualization",
             data=result["gradcam_visualization_bytes"],
@@ -134,8 +113,11 @@ def render_saved_results(results):
 
 
 st.header("Upload Your Images")
-st.markdown("You have the option to select images from our curated gallery or upload your own unique photos to personalize your experience.")
-st.markdown("Scroll down for results ⏬ It may take a few seconds, so thank you for your patience! 😊")
+st.markdown(
+    "You have the option to select images from our curated gallery or upload your "
+    "own unique photos to personalize your experience."
+)
+st.markdown("Scroll down for results. It may take a few seconds; thank you for your patience!")
 
 gallery_placeholder = st.empty()
 with gallery_placeholder.container():
@@ -154,7 +136,9 @@ process_gallery_image = st.button("Process Selected Image")
 
 st.markdown("Or upload your own images:")
 with st.form("my-form", clear_on_submit=True):
-    uploaded_files = st.file_uploader("Upload file", accept_multiple_files=True, type=["jpg", "jpeg"])
+    uploaded_files = st.file_uploader(
+        "Upload file", accept_multiple_files=True, type=["jpg", "jpeg"]
+    )
     if uploaded_files and len(uploaded_files) > 3:
         uploaded_files = uploaded_files[:3]
         st.warning("Maximum 3 files allowed.")
@@ -165,9 +149,8 @@ if submitted_upload or process_gallery_image:
         st.warning("Please upload at least one image file.")
     else:
         with st.spinner("This might take a couple seconds, please wait..."):
-            time.sleep(3)
             unique_folder_path = create_unique_folder("uploads/")
-            class_folder_path = os.path.join(unique_folder_path, "building")
+            class_folder_path = os.path.join(unique_folder_path, "uploaded")
             os.makedirs(class_folder_path, exist_ok=True)
 
             if selected_gallery_image and process_gallery_image:
@@ -178,13 +161,10 @@ if submitted_upload or process_gallery_image:
                     destination.write(source.read())
 
             for uploaded_file in uploaded_files or []:
-                if allowed_file(uploaded_file.name, {"jpg", "jpeg"}):
+                if allowed_file(uploaded_file.name, {"jpg", "jpeg", "png"}):
                     with open(os.path.join(class_folder_path, uploaded_file.name), "wb") as destination:
                         destination.write(uploaded_file.getbuffer())
 
-            # This is the only point that replaces a completed analysis: a
-            # user explicitly began another processing workflow. Download
-            # reruns never enter this branch.
             st.session_state[ANALYSIS_STATE_KEY] = build_analysis_results(
                 unique_folder_path, class_folder_path
             )

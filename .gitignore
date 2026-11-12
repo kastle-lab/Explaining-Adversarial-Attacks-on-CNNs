@@ -371,3 +371,10 @@ FodyWeavers.xsd
 input_images/
 batch_results/
 uploads/
+
+# The reversible 10-class migration backup is an intentional project artifact.
+!backups/
+!backups/10-class/
+!backups/10-class/activation_cutoffs_ensemble.xlsx
+!backups/10-class/backup_manifest.json
+!backups/10-class/model_resnet50V2_10classes_retest2023June.h5
