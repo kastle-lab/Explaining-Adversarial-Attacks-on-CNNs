@@ -4,6 +4,7 @@ import csv
 import json
 import tempfile
 import unittest
+from contextlib import chdir
 from pathlib import Path
 from unittest.mock import patch
 
@@ -27,6 +28,7 @@ from demonstrator import (
     activation_rows_for,
     generate_gradcam,
     load_activation_scene_associations,
+    scene_rate_rows_for,
 )
 
 
@@ -64,19 +66,22 @@ class ModelIntegrationTests(unittest.TestCase):
         rows = activation_rows_for(vector)
         self.assertEqual(len(rows), 64)
         self.assertEqual(int(rows["Reference Available"].sum()), 61)
-        self.assertEqual(int(rows["Association Available"].sum()), 34)
+        self.assertEqual(int(rows["Association Available"].sum()), 21)
 
     def test_activation_scene_associations(self):
         associations = load_activation_scene_associations()
         self.assertEqual(len(associations), 64)
         self.assertEqual(
             associations["evidence_tier"].value_counts().to_dict(),
-            {"ambiguous": 27, "moderate": 20, "high": 14, "inactive": 3},
+            {"ambiguous": 25, "moderate": 23, "high": 13, "inactive": 3},
         )
         self.assertEqual(associations.loc[33, "primary_scene"], "highway")
         self.assertEqual(associations.loc[33, "evidence_tier"], "high")
         self.assertEqual(associations.loc[40, "primary_scene"], "kitchen")
         self.assertEqual(associations.loc[27, "evidence_tier"], "inactive")
+        self.assertEqual((associations["mapping_status"] == "retained").sum(), 21)
+        self.assertEqual(set(associations["reference_sample_count"]), {1435})
+        self.assertEqual(scene_rate_rows_for(np.zeros(64)), [])
 
     def test_regenerated_positive_and_negative_examples(self):
         config = get_model_config()
@@ -150,7 +155,7 @@ class EndToEndTests(unittest.TestCase):
                 activations = list(csv.DictReader(handle))
             self.assertEqual(len(activations), 7 * 64)
             self.assertEqual(
-                sum(row["association_available"] == "True" for row in activations), 7 * 34
+                sum(row["association_available"] == "True" for row in activations), 7 * 21
             )
             self.assertTrue(all(row["scene_associations_sha256"] for row in activations))
 
@@ -221,6 +226,28 @@ class EndToEndTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "incompatible model pipeline"):
                 run_batch(input_dir, output_dir, seed=42)
             self.assertEqual(json.loads(manifest_path.read_text(encoding="utf-8")), legacy)
+
+    def test_gallery_renders_measured_scene_bars_and_existing_results(self):
+        page = PROJECT_ROOT / "pages" / "Explore_ConceptLens.py"
+        with tempfile.TemporaryDirectory(dir=PROJECT_ROOT) as directory, chdir(directory), patch(
+            "streamlit_image_select.image_select", return_value=str(EXAMPLE_IMAGE)
+        ):
+            app = AppTest.from_file(str(page), default_timeout=60).run()
+            app.button[0].click().run()
+
+        self.assertEqual(len(app.exception), 0)
+        self.assertTrue(any("Scene Associations and Non-target Activation Rates" in x.value for x in app.markdown))
+        self.assertTrue(any("Predicted Class: highway" in x.value for x in app.markdown))
+        self.assertTrue(any("Grad-CAM Saliency Map" in x.value for x in app.markdown))
+        self.assertTrue(any("Validated concept names" in x.value for x in app.info))
+        self.assertEqual(len(app.get("imgs")), 2)
+        chart, = app.get("arrow_vega_lite_chart")
+        spec = json.loads(chart.proto.spec)
+        self.assertEqual(spec["encoding"]["x"]["field"], "non_target_pct")
+        self.assertEqual(spec["encoding"]["x"]["scale"]["domain"], [0, 100])
+        self.assertIn("Highway \u00b7 5.5% (26/471) \u00b7 N18 \u00b7 >40%",
+                      spec["encoding"]["y"]["sort"])
+        self.assertEqual(len(spec["encoding"]["y"]["sort"]), 12)
 
     def test_streamlit_pages_render_without_exceptions(self):
         for relative_path in ("Home.py", "pages/Explore_ConceptLens.py"):

@@ -26,6 +26,7 @@ from conceptlens_model import (
     prediction_records,
     preprocess_image_path,
 )
+from tools.build_activation_calibration import CUTOFFS, RATE_COLUMNS, select_cutoff
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png"}
@@ -64,9 +65,12 @@ def figure_to_png_bytes(figure: Any) -> bytes:
 
 @lru_cache(maxsize=1)
 def load_activation_reference() -> pd.DataFrame:
-    path = PROJECT_ROOT / get_model_config()["activation_reference"]
+    config = get_model_config()
+    path = PROJECT_ROOT / config["activation_reference"]
+    if file_sha256(path) != config["activation_reference_sha256"].upper():
+        raise ActivationAnalysisError(f"Discovery activation reference hash mismatch: {path}")
     frame = pd.read_csv(path)
-    expected_ids = list(range(get_model_config()["activation_units"]))
+    expected_ids = list(range(config["activation_units"]))
     if frame["neuron_id"].tolist() != expected_ids:
         raise ActivationAnalysisError("Activation reference must contain neuron IDs 0 through 63.")
     return frame
@@ -93,11 +97,8 @@ def activation_rows_for(
 ) -> pd.DataFrame:
     """Describe new-model neurons without assigning legacy semantics.
 
-    Reference percentages compare each value with the maximum observed in the
-    supplied 1,921-image Stage 1 activation CSV. High/moderate-evidence scene
-    associations come from descriptive one-vs-rest AUC analysis of the same
-    reference. Neither value is a probability, error rate, object concept, or
-    causal claim about neuron identity.
+    Reference maxima and one-vs-rest scene evidence use the discovery split
+    of the Stage 1 activation CSV.
     """
     values = np.asarray(activations, dtype=np.float64).reshape(-1)
     expected = get_model_config()["activation_units"]
@@ -128,7 +129,7 @@ def activation_rows_for(
             ),
             "AUC Margin": pd.to_numeric(associations["auc_margin"], errors="coerce"),
             "Evidence Tier": associations["evidence_tier"],
-            "Association Available": associations["evidence_tier"].isin({"high", "moderate"}),
+            "Association Available": associations["mapping_status"].eq("retained"),
             "Image Name": image_name,
         }
     )
@@ -140,6 +141,49 @@ def activation_rows_for(
         .head(top_n)
         .reset_index(drop=True)
     )
+
+
+@lru_cache(maxsize=1)
+def load_scene_activation_rates() -> pd.DataFrame:
+    config = get_model_config()
+    path = PROJECT_ROOT / config["scene_activation_rates"]
+    if file_sha256(path) != config["scene_activation_rates_sha256"].upper():
+        raise ActivationAnalysisError(f"Held-out scene activation rate hash mismatch: {path}")
+    frame = pd.read_csv(path)
+    if list(frame.columns) != list(RATE_COLUMNS):
+        raise ActivationAnalysisError("Held-out scene activation rates have incompatible columns.")
+    associations = load_activation_scene_associations()
+    retained = associations[associations["mapping_status"].eq("retained")]
+    expected = {
+        (row.neuron_id, row.primary_scene, cutoff)
+        for row in retained.itertuples() for cutoff in CUTOFFS
+    }
+    recorded = list(frame[["neuron_id", "scene_id", "cutoff_pct"]].itertuples(index=False, name=None))
+    if len(recorded) != len(expected) or set(recorded) != expected:
+        raise ActivationAnalysisError("Held-out scene activation rates do not match the frozen mappings.")
+    return frame.set_index(["neuron_id", "cutoff_pct"])
+
+
+def scene_rate_rows_for(activations: np.ndarray) -> list[dict[str, Any]]:
+    """Select the measured held-out rate at each mapped neuron's exceeded cutoff."""
+    rates = load_scene_activation_rates()
+    profile = activation_rows_for(activations)
+    rows = []
+    for _, row in profile[profile["Association Available"]].iterrows():
+        cutoff = select_cutoff(row["Activation Value"], row["Reference Maximum"])
+        if cutoff is None:
+            continue
+        neuron = int(row["Neuron ID"])
+        measured = rates.loc[(neuron, cutoff)]
+        rows.append({
+            "scene": row["Scene Association"].replace("_", " ").title(),
+            "neuron_id": neuron,
+            "cutoff_pct": cutoff,
+            "non_target_pct": float(measured["non_target_pct"]),
+            "non_target_activated": int(measured["non_target_activated"]),
+            "non_target_total": int(measured["non_target_total"]),
+        })
+    return sorted(rows, key=lambda row: (row["non_target_pct"], row["neuron_id"]))
 
 
 def plot_activation_bars(axis: Any, activation_results: pd.DataFrame, top_n: int = 10) -> None:
@@ -165,7 +209,7 @@ def plot_activation_bars(axis: Any, activation_results: pd.DataFrame, top_n: int
             labels,
             filtered["Reference Percentage"],
         )
-    axis.set_xlabel("Activation as % of Stage 1 reference maximum")
+    axis.set_xlabel("Activation as % of the discovery reference maximum")
 
 
 def render_activation_visualization(
@@ -179,7 +223,7 @@ def render_activation_visualization(
     figure.text(
         0.035,
         0.925,
-        "Supported labels are statistical scene associations; legacy object concepts/error rates remain unavailable.",
+        "Scene labels use discovery evidence and sufficient held-out scene support.",
         ha="left",
         va="top",
         fontsize=10,

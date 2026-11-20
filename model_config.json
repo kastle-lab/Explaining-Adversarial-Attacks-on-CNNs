@@ -5,11 +5,11 @@
   "labels": "class_labels_50.json",
   "activation_reference": "activation_reference_50class.csv",
   "activation_scene_associations": "activation_scene_associations_50class.csv",
-  "activation_scene_associations_sha256": "B461BCB5706B3E8C3A22998AA7DEDCA2B94BE74919EFB130BDFED4E14F6CD9FA",
+  "activation_scene_associations_sha256": "2790012047E97EA5A89CCFC85078AFB9860E68F61ACDD89985BF317F52896EE3",
   "positive_examples": "positive_images_50class.csv",
-  "positive_examples_sha256": "395AADAE18305D1B462B87A6F36A9DB23F06C03588FEAB2CA7DB224C4B4C1704",
+  "positive_examples_sha256": "B2D674AA9C29662D2A3DEAC5AC9B71616BAAD6B06F6899DE9C4583269CE82445",
   "negative_examples": "negative_images_50class.csv",
-  "negative_examples_sha256": "36EE6BB298F6D46FBDE77CAFC9EF758B3A3DCBF3B9514DCA51E38B5C503ED7D7",
+  "negative_examples_sha256": "2FFE3717A5CF72A738FB16E76779A5C77E4CB8BF6506DC17503B648CFEFB9DC1",
   "input": {
     "height": 224,
     "width": 224,
@@ -25,7 +25,11 @@
   "gradcam_layer": "post_relu",
   "ontology_concept_semantics_available": false,
   "scene_associations_available": true,
-  "scene_associations_note": "High/moderate-evidence labels are descriptive one-vs-rest scene associations from the 1,921-image activation reference. They are not object-level ontology concepts, causal neuron identities, probabilities, or error rates."
+  "scene_associations_note": "One-vs-rest scene associations use discovery activations. The rates measure activation on other labeled scenes in the held-out split.",
+  "activation_reference_sha256": "01218AAC7DAB76EFD8F38FF60BA240290342529057478DCBF1506F5E7F83D46A",
+  "scene_activation_split": "scene_activation_split_50class.csv",
+  "scene_activation_split_sha256": "88EC5FF8148FCDBB1872E001C8772EABEF203649B504CF0BDA7954CB80F4522A",
+  "scene_activation_rates": "scene_activation_rates_50class.csv",
+  "scene_activation_rates_sha256": "794099DD4853C0905F11EEE21D8BCAED02134BCE3B51D8F011F6FE2DD793807E",
+  "scene_activation_source_sha256": "F780BA06CA6AB8447CDCA888334915DF91BC528280564A120015C498B32FCE25"
 }
-
-

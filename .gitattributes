@@ -61,3 +61,11 @@
 #*.PDF   diff=astextplain
 #*.rtf   diff=astextplain
 #*.RTF   diff=astextplain
+
+# Generated calibration CSVs are checked with byte-level SHA-256 hashes.
+/activation_reference_50class.csv text eol=lf
+/activation_scene_associations_50class.csv text eol=lf
+/positive_images_50class.csv text eol=lf
+/negative_images_50class.csv text eol=lf
+/scene_activation_rates_50class.csv text eol=lf
+/scene_activation_split_50class.csv text eol=lf

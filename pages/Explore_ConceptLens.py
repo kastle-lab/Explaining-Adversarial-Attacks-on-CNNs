@@ -2,15 +2,20 @@ import os
 import uuid
 from io import BytesIO
 
+import altair as alt
+import pandas as pd
 import streamlit as st
 from PIL import Image
 from streamlit_image_select import image_select
 
+from conceptlens_model import activation_model_for, load_conceptlens_model, preprocess_image_path
 from demonstrator import (
+    ActivationAnalysisError,
     GradCAMError,
     figure_to_png_bytes,
     generate_gradcam,
     render_gradcam_visualization,
+    scene_rate_rows_for,
 )
 
 
@@ -36,7 +41,7 @@ def image_to_png_bytes(image):
 def build_analysis_results(unique_folder_path, class_folder_path):
     """Run model work once and retain display/download artifacts for reruns."""
     results = []
-
+    extractor = None
     for image_name in sorted(os.listdir(class_folder_path)):
         image_path = os.path.join(class_folder_path, image_name)
         if not os.path.isfile(image_path):
@@ -46,6 +51,8 @@ def build_analysis_results(unique_folder_path, class_folder_path):
             "image_path": image_path,
             "image_name": image_name,
             "gradcam_error": None,
+            "scene_rates": [],
+            "scene_rate_error": None,
         }
         try:
             gradcam_result = generate_gradcam(image_path)
@@ -66,11 +73,58 @@ def build_analysis_results(unique_folder_path, class_folder_path):
             )
         except GradCAMError as exc:
             result["gradcam_error"] = str(exc)
+        else:
+            try:
+                if extractor is None:
+                    extractor = activation_model_for(load_conceptlens_model())
+                vector = extractor(preprocess_image_path(image_path), training=False).numpy()[0]
+                result["scene_rates"] = scene_rate_rows_for(vector)
+            except (ActivationAnalysisError, OSError) as exc:
+                result["scene_rate_error"] = str(exc)
         results.append(result)
     return results
 
 
+def render_scene_rates(results):
+    st.markdown("### Scene Associations and Non-target Activation Rates")
+    st.caption(
+        "The bars show how often the associated neuron exceeded the shown cutoff on "
+        "held-out images labeled as other scenes."
+    )
+    for result in results:
+        st.markdown(f"**{result['image_name']}**")
+        if result["scene_rate_error"] or result["gradcam_error"]:
+            st.info("Scene activation rates are unavailable for this image.")
+            continue
+        if not result["scene_rates"]:
+            st.info("No mapped neuron exceeded a reference cutoff for this image.")
+            continue
+
+        rows = pd.DataFrame(result["scene_rates"])
+        rows["association"] = [
+            f"{row.scene} · {row.non_target_pct:.1f}% ({row.non_target_activated}/{row.non_target_total})"
+            f" · N{row.neuron_id} · >{row.cutoff_pct}%"
+            for row in rows.itertuples()
+        ]
+        chart = alt.Chart(rows).mark_bar(color="#336BB3").encode(
+            x=alt.X("non_target_pct:Q", title="Held-out non-target activation (%)",
+                    scale=alt.Scale(domain=[0, 100])),
+            y=alt.Y("association:N", title=None, sort=rows["association"].tolist(),
+                    axis=alt.Axis(labelLimit=440)),
+            tooltip=[
+                alt.Tooltip("scene:N", title="Associated scene"),
+                alt.Tooltip("neuron_id:Q", title="Neuron"),
+                alt.Tooltip("cutoff_pct:Q", title="Cutoff (% of discovery max)"),
+                alt.Tooltip("non_target_pct:Q", title="Non-target activation (%)", format=".1f"),
+                alt.Tooltip("non_target_activated:Q", title="Other-scene images activated"),
+                alt.Tooltip("non_target_total:Q", title="Other-scene images held out"),
+            ],
+        ).properties(height=alt.Step(25))
+        st.altair_chart(chart, use_container_width=True)
+
+
 def render_saved_results(results):
+    render_scene_rates(results)
     st.markdown("### Detected Concepts and Error-rate Percentages")
     st.info(
         "Validated concept names and error-rate percentages are unavailable for "
