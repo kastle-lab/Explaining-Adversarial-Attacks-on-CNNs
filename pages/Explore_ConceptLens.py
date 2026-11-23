@@ -5,6 +5,7 @@ from io import BytesIO
 import altair as alt
 import pandas as pd
 import streamlit as st
+from matplotlib.figure import Figure
 from PIL import Image
 from streamlit_image_select import image_select
 
@@ -20,6 +21,9 @@ from demonstrator import (
 
 
 ANALYSIS_STATE_KEY = "conceptlens_analysis_results"
+SCENE_RATES_TITLE = "Scene Associations and Non-target Activation Rates"
+SCENE_RATES_AXIS_TITLE = "Held-out non-target activation (%)"
+SCENE_RATES_BAR_COLOR = "#336BB3"
 
 
 def allowed_file(filename, allowed_extensions):
@@ -85,8 +89,23 @@ def build_analysis_results(unique_folder_path, class_folder_path):
     return results
 
 
+def scene_rates_to_png(rows, image_name):
+    figure = Figure(figsize=(10, 1.6 + 0.25 * len(rows)), layout="constrained")
+    axis = figure.subplots()
+    axis.barh(rows["association"], rows["non_target_pct"], color=SCENE_RATES_BAR_COLOR)
+    axis.invert_yaxis()
+    axis.set_xlim(0, 100)
+    axis.set_xticks(range(0, 101, 10))
+    axis.set_xlabel(SCENE_RATES_AXIS_TITLE)
+    axis.set_title(image_name, loc="left")
+    axis.set_axisbelow(True)
+    axis.grid(axis="x", color="#e6e9ef")
+    figure.suptitle(SCENE_RATES_TITLE, fontweight="bold")
+    return figure_to_png_bytes(figure)
+
+
 def render_scene_rates(results):
-    st.markdown("### Scene Associations and Non-target Activation Rates")
+    st.markdown(f"### {SCENE_RATES_TITLE}")
     st.caption(
         "The bars show how often the associated neuron exceeded the shown cutoff on "
         "held-out images labeled as other scenes."
@@ -106,8 +125,8 @@ def render_scene_rates(results):
             f" · N{row.neuron_id} · >{row.cutoff_pct}%"
             for row in rows.itertuples()
         ]
-        chart = alt.Chart(rows).mark_bar(color="#336BB3").encode(
-            x=alt.X("non_target_pct:Q", title="Held-out non-target activation (%)",
+        chart = alt.Chart(rows).mark_bar(color=SCENE_RATES_BAR_COLOR).encode(
+            x=alt.X("non_target_pct:Q", title=SCENE_RATES_AXIS_TITLE,
                     scale=alt.Scale(domain=[0, 100])),
             y=alt.Y("association:N", title=None, sort=rows["association"].tolist(),
                     axis=alt.Axis(labelLimit=440)),
@@ -121,15 +140,17 @@ def render_scene_rates(results):
             ],
         ).properties(height=alt.Step(25))
         st.altair_chart(chart, use_container_width=True)
+        st.download_button(
+            "Download Scene Association Chart",
+            data=scene_rates_to_png(rows, result["image_name"]),
+            file_name=f"{os.path.splitext(result['image_name'])[0]}_scene_associations.png",
+            mime="image/png",
+            key=f"scene-rates-download-{result['image_name']}",
+        )
 
 
 def render_saved_results(results):
     render_scene_rates(results)
-    st.markdown("### Detected Concepts and Error-rate Percentages")
-    st.info(
-        "Validated concept names and error-rate percentages are unavailable for "
-        "the 50-class model because the original 10-class calibration is incompatible."
-    )
 
     st.markdown("### Grad-CAM Saliency Map")
     st.caption(

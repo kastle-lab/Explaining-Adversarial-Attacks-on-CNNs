@@ -45,7 +45,7 @@ Grad-CAM targets `post_relu`, verified at layer index 189 with shape `(None, 7, 
 
 ## Scene Associations and Non-target Activation Rates
 
-Explore displays one bar per retained neuron that activates on the current image. The bar shows the percentage of held-out images labeled as other scenes whose activation exceeded the displayed cutoff. The count is the number of those images activated over the total number of other-scene images. The bars describe this held-out Stage 1 sample. Scene predictions, Grad-CAM, and the separate object-concept status are also available.
+Explore displays one bar per retained neuron that activates on the current image. The bar shows the percentage of held-out images labeled as other scenes whose activation exceeded the displayed cutoff. The count is the number of those images activated over the total number of other-scene images. The bars describe this held-out Stage 1 sample. Use **Download Scene Association Chart** below the chart to save it as a PNG. Scene predictions and Grad-CAM are also available.
 
 ### Discovery and held-out rates
 

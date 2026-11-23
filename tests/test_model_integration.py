@@ -5,11 +5,13 @@ import json
 import tempfile
 import unittest
 from contextlib import chdir
+from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
+import streamlit as st
 from PIL import Image
 from streamlit.testing.v1 import AppTest
 
@@ -231,7 +233,9 @@ class EndToEndTests(unittest.TestCase):
         page = PROJECT_ROOT / "pages" / "Explore_ConceptLens.py"
         with tempfile.TemporaryDirectory(dir=PROJECT_ROOT) as directory, chdir(directory), patch(
             "streamlit_image_select.image_select", return_value=str(EXAMPLE_IMAGE)
-        ):
+        ), patch(
+            "streamlit.download_button", wraps=st.download_button
+        ) as download_button:
             app = AppTest.from_file(str(page), default_timeout=60).run()
             app.button[0].click().run()
 
@@ -239,7 +243,16 @@ class EndToEndTests(unittest.TestCase):
         self.assertTrue(any("Scene Associations and Non-target Activation Rates" in x.value for x in app.markdown))
         self.assertTrue(any("Predicted Class: highway" in x.value for x in app.markdown))
         self.assertTrue(any("Grad-CAM Saliency Map" in x.value for x in app.markdown))
-        self.assertTrue(any("Validated concept names" in x.value for x in app.info))
+        self.assertFalse(any("Detected Concepts and Error-rate Percentages" in x.value for x in app.markdown))
+        self.assertFalse(any("Validated concept names" in x.value for x in app.info))
+        scene_download, gradcam_download = download_button.call_args_list
+        self.assertEqual(scene_download.args[0], "Download Scene Association Chart")
+        self.assertEqual(scene_download.kwargs["file_name"], "highway_scene_associations.png")
+        self.assertEqual(scene_download.kwargs["mime"], "image/png")
+        with Image.open(BytesIO(scene_download.kwargs["data"])) as chart_image:
+            self.assertEqual(chart_image.format, "PNG")
+            chart_image.verify()
+        self.assertEqual(gradcam_download.kwargs["file_name"], "highway_gradcam.png")
         self.assertEqual(len(app.get("imgs")), 2)
         chart, = app.get("arrow_vega_lite_chart")
         spec = json.loads(chart.proto.spec)
